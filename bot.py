@@ -83,7 +83,12 @@ def rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def detect_candle_pattern(candle, prev_candle):
+def detect_candle_pattern(candles_window):
+    """Rozpoznaje formację świecową na bazie ostatnich 1-3 świec.
+    candles_window: lista świec, gdzie ostatnia (candles_window[-1]) to bieżąca."""
+    candle = candles_window[-1]
+    prev_candle = candles_window[-2]
+
     body = abs(candle["close"] - candle["open"])
     range_ = candle["high"] - candle["low"]
     if range_ == 0:
@@ -91,14 +96,49 @@ def detect_candle_pattern(candle, prev_candle):
     upper_wick = candle["high"] - max(candle["close"], candle["open"])
     lower_wick = min(candle["close"], candle["open"]) - candle["low"]
 
+    prev_body = abs(prev_candle["close"] - prev_candle["open"])
+    prev_is_down = prev_candle["close"] < prev_candle["open"]
+    prev_is_up = prev_candle["close"] > prev_candle["open"]
+
+    # --- Formacje 3-świecowe (sprawdzane najpierw, bo są bardziej specyficzne) ---
+    if len(candles_window) >= 3:
+        c1, c2, c3 = candles_window[-3], candles_window[-2], candles_window[-1]
+        c1_body = abs(c1["close"] - c1["open"])
+        c3_body = abs(c3["close"] - c3["open"])
+        # Morning Star: spadek, mała świeca (niezdecydowanie), silny wzrost
+        if (c1["close"] < c1["open"] and c1_body > 0
+                and abs(c2["close"] - c2["open"]) < c1_body * 0.4
+                and c3["close"] > c3["open"] and c3_body > c1_body * 0.6
+                and c3["close"] > (c1["open"] + c1["close"]) / 2):
+            return "Morning Star (silne odbicie w górę)"
+        # Evening Star: wzrost, mała świeca, silny spadek
+        if (c1["close"] > c1["open"] and c1_body > 0
+                and abs(c2["close"] - c2["open"]) < c1_body * 0.4
+                and c3["close"] < c3["open"] and c3_body > c1_body * 0.6
+                and c3["close"] < (c1["open"] + c1["close"]) / 2):
+            return "Evening Star (silne odwrócenie w dół)"
+
+    # --- Formacje 1-świecowe zależne od kontekstu (trend przed świecą) ---
     if body / range_ < 0.1:
         return "Doji (niezdecydowanie)"
-    if lower_wick > body * 2 and candle["close"] > candle["open"]:
-        return "Pin bar / Hammer (możliwe odbicie w górę)"
-    if upper_wick > body * 2 and candle["close"] < candle["open"]:
-        return "Pin bar odwrócony (możliwe odbicie w dół)"
-    # Engulfing
-    prev_body = abs(prev_candle["close"] - prev_candle["open"])
+
+    if lower_wick > body * 2 and upper_wick < body * 0.5:
+        # Długi dolny knot: Hammer (po spadku) lub Hanging Man (po wzroście)
+        if prev_is_down:
+            return "Hammer (możliwe odbicie w górę)"
+        elif prev_is_up:
+            return "Hanging Man (ostrzeżenie przed spadkiem)"
+        return "Pin bar / długi dolny knot"
+
+    if upper_wick > body * 2 and lower_wick < body * 0.5:
+        # Długi górny knot: Shooting Star (po wzroście) lub Inverted Hammer (po spadku)
+        if prev_is_up:
+            return "Shooting Star (ostrzeżenie przed spadkiem)"
+        elif prev_is_down:
+            return "Inverted Hammer (możliwe odbicie w górę)"
+        return "Pin bar odwrócony / długi górny knot"
+
+    # --- Engulfing ---
     if (candle["close"] > candle["open"] and prev_candle["close"] < prev_candle["open"]
             and candle["close"] > prev_candle["open"] and candle["open"] < prev_candle["close"]
             and body > prev_body):
@@ -108,6 +148,18 @@ def detect_candle_pattern(candle, prev_candle):
             and body > prev_body):
         return "Bearish Engulfing"
     return None
+
+
+def atr(candles, period=14):
+    """Average True Range - miara zmienności, używana do sugerowania SL/TP."""
+    if len(candles) < period + 1:
+        period = len(candles) - 1
+    trs = []
+    for i in range(1, len(candles)):
+        high, low, prev_close = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    return sum(trs[-period:]) / period if trs else 0
 
 
 # ---------------------- ANALIZA ----------------------
@@ -124,15 +176,25 @@ def analyze(candles):
     current_volume = volumes[-1]
     volume_ratio = current_volume / avg_volume if avg_volume else 1
 
-    # Trend na podstawie EMA
+    # Trend na podstawie EMA (to jest OPÓŹNIONE - może się mylić przy świeżym zwrocie)
     trend = "wzrostowy" if ema20[-1] > ema50[-1] else "spadkowy"
     trend_strength = abs(ema20[-1] - ema50[-1]) / current_price * 100
 
-    pattern = detect_candle_pattern(candles[-1], candles[-2])
+    pattern = detect_candle_pattern(candles[-3:] if len(candles) >= 3 else candles[-2:])
+    current_atr = atr(candles)
 
     # Zmiana ceny za noc / ostatnie N świec (np. ostatnie 16 świec 30m = ~8h)
     lookback = min(16, len(closes) - 1)
     overnight_change_pct = (closes[-1] - closes[-1 - lookback]) / closes[-1 - lookback] * 100
+
+    # ---- NOWE: świeże momentum z ostatnich 3-4 świec (żeby złapać zwrot zanim EMA go zauważy) ----
+    recent_n = min(4, len(closes) - 1)
+    recent_closes = closes[-(recent_n + 1):]
+    recent_change_pct = (recent_closes[-1] - recent_closes[0]) / recent_closes[0] * 100
+    # czy ostatnie świece konsekwentnie spadają / rosną
+    recent_diffs = [recent_closes[i + 1] - recent_closes[i] for i in range(len(recent_closes) - 1)]
+    falling_streak = all(d < 0 for d in recent_diffs)
+    rising_streak = all(d > 0 for d in recent_diffs)
 
     # ---- Prosty composite "signal score" (0-100), NIE prawdziwe prawdopodobieństwo ----
     score = 50
@@ -154,22 +216,50 @@ def analyze(candles):
     if volume_ratio > 1.5:
         score += 10 if trend == "wzrostowy" else -10
 
-    if pattern and "górę" in (pattern or ""):
+    # Klasyfikacja formacji świecowej: bycza / niedźwiedzia / ostrzegawcza
+    bullish_patterns = ("Hammer", "Bullish Engulfing", "Morning Star", "Inverted Hammer")
+    bearish_patterns = ("Bearish Engulfing", "Evening Star", "Shooting Star", "Hanging Man")
+    if pattern and any(p in pattern for p in bullish_patterns):
         score += 10
         direction = "long"
-    if pattern and "dół" in (pattern or ""):
-        score -= 10
-        direction = "short"
-    if pattern == "Bullish Engulfing":
-        score += 10
-        direction = "long"
-    if pattern == "Bearish Engulfing":
+    if pattern and any(p in pattern for p in bearish_patterns):
         score -= 10
         direction = "short"
 
+    # ---- NOWE: świeże momentum ma DUŻĄ wagę - przebija opóźnione EMA ----
+    momentum_override = None
+    if falling_streak and abs(recent_change_pct) > 0.3:
+        score -= 20
+        momentum_override = "short"
+    elif rising_streak and abs(recent_change_pct) > 0.3:
+        score += 20
+        momentum_override = "long"
+
     score = max(0, min(100, score))
-    if direction == "neutralny":
-        direction = "long" if score > 55 else ("short" if score < 45 else "neutralny")
+
+    # Kierunek finalny: świeże momentum ma pierwszeństwo nad opóźnionym trendem EMA
+    if momentum_override:
+        direction = momentum_override
+    elif direction == "neutralny":
+        # Podniesiony próg (był >55/<45) - score blisko środka = szczerze "neutralny", nie fałszywy sygnał
+        direction = "long" if score >= 65 else ("short" if score <= 35 else "neutralny")
+
+    # ---- Sugerowane poziomy entry/SL/TP na bazie ATR (miara zmienności) ----
+    # To orientacyjne poziomy, nie rekomendacja - zawsze weryfikuj samodzielnie.
+    entry_zone = None
+    stop_loss = None
+    take_profit_1 = None
+    take_profit_2 = None
+    if direction == "long":
+        entry_zone = (current_price - current_atr * 0.3, current_price)
+        stop_loss = current_price - current_atr * 1.5
+        take_profit_1 = current_price + current_atr * 1.5
+        take_profit_2 = current_price + current_atr * 3
+    elif direction == "short":
+        entry_zone = (current_price, current_price + current_atr * 0.3)
+        stop_loss = current_price + current_atr * 1.5
+        take_profit_1 = current_price - current_atr * 1.5
+        take_profit_2 = current_price - current_atr * 3
 
     return {
         "price": current_price,
@@ -178,9 +268,17 @@ def analyze(candles):
         "rsi": current_rsi,
         "volume_ratio": volume_ratio,
         "pattern": pattern,
+        "atr": current_atr,
         "overnight_change_pct": overnight_change_pct,
+        "recent_change_pct": recent_change_pct,
+        "momentum_warning": momentum_override,
         "score": score,
         "direction": direction,
+        "entry_zone": entry_zone,
+        "stop_loss": stop_loss,
+        "take_profit_1": take_profit_1,
+        "take_profit_2": take_profit_2,
+        "candles": candles,  # potrzebne do wygenerowania wykresu
     }
 
 
@@ -189,20 +287,95 @@ def format_report(a, symbol):
     lines = [
         f"📊 *{symbol}* — {now}",
         f"Cena: `{a['price']:.2f}`",
-        f"Trend (EMA20 vs EMA50): *{a['trend']}* (siła: {a['trend_strength']:.2f}%)",
+        f"Trend (EMA20 vs EMA50): *{a['trend']}* (siła: {a['trend_strength']:.2f}%) [wskaźnik opóźniony]",
         f"RSI(14): {a['rsi']:.1f}" if a["rsi"] else "RSI: brak danych",
         f"Wolumen vs średnia(20): {a['volume_ratio']:.2f}x",
         f"Zmiana za ostatnie ~8h: {a['overnight_change_pct']:+.2f}%",
+        f"Świeże momentum (ostatnie świece): {a['recent_change_pct']:+.2f}%",
     ]
+    if a.get("momentum_warning"):
+        lines.append(f"⚠️ Świeże momentum ({a['momentum_warning'].upper()}) przebija opóźniony trend EMA!")
     if a["pattern"]:
         lines.append(f"Formacja świecowa: {a['pattern']}")
     lines.append("")
     lines.append(f"🎯 Signal score: *{a['score']}/100* → kierunek: *{a['direction'].upper()}*")
+    if a["direction"] in ("long", "short") and a["entry_zone"]:
+        lines.append("")
+        lines.append(f"📍 Orientacyjne poziomy (ATR={a['atr']:.2f}):")
+        lines.append(f"   Entry: `{a['entry_zone'][0]:.2f} - {a['entry_zone'][1]:.2f}`")
+        lines.append(f"   SL: `{a['stop_loss']:.2f}`")
+        lines.append(f"   TP1: `{a['take_profit_1']:.2f}`  TP2: `{a['take_profit_2']:.2f}`")
     lines.append("_To wskaźnik techniczny, nie gwarancja. Zawsze rób własny research._")
     return "\n".join(lines)
 
 
+# ---------------------- WYKRES ----------------------
+def generate_chart(a, symbol, n_candles=40):
+    """Rysuje wykres świecowy (ostatnie n_candles) + wolumen + poziomy entry/SL/TP.
+    Zwraca bytes PNG gotowe do wysłania na Telegram."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from io import BytesIO
+
+    candles = a["candles"][-n_candles:]
+    fig, (ax_price, ax_vol) = plt.subplots(
+        2, 1, figsize=(10, 6), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+        facecolor="#0d1117"
+    )
+    for ax in (ax_price, ax_vol):
+        ax.set_facecolor("#0d1117")
+        ax.tick_params(colors="#c9d1d9")
+        for spine in ax.spines.values():
+            spine.set_color("#30363d")
+
+    up_color, down_color = "#26a69a", "#ef5350"
+    width = 0.6
+
+    for i, c in enumerate(candles):
+        color = up_color if c["close"] >= c["open"] else down_color
+        # knot
+        ax_price.plot([i, i], [c["low"], c["high"]], color=color, linewidth=1)
+        # korpus
+        body_low = min(c["open"], c["close"])
+        body_height = abs(c["close"] - c["open"]) or (c["high"] - c["low"]) * 0.01
+        ax_price.add_patch(Rectangle((i - width / 2, body_low), width, body_height,
+                                      facecolor=color, edgecolor=color))
+        # wolumen
+        ax_vol.bar(i, c["volume"], color=color, width=width)
+
+    # Linie entry / SL / TP
+    if a["direction"] in ("long", "short") and a["entry_zone"]:
+        ax_price.axhline(a["stop_loss"], color="#ef5350", linestyle="--", linewidth=1, label="SL")
+        ax_price.axhline(a["take_profit_1"], color="#26a69a", linestyle="--", linewidth=1, label="TP1")
+        ax_price.axhline(a["take_profit_2"], color="#26a69a", linestyle=":", linewidth=1, label="TP2")
+        ax_price.axhspan(a["entry_zone"][0], a["entry_zone"][1], color="#f0b90b", alpha=0.15)
+        ax_price.legend(loc="upper left", facecolor="#0d1117", labelcolor="#c9d1d9", framealpha=0.7)
+
+    ax_price.set_title(f"{symbol} — score {a['score']}/100 ({a['direction'].upper()})",
+                        color="#c9d1d9", fontsize=12)
+    ax_vol.set_xlabel("Świece (najnowsza po prawej)", color="#c9d1d9")
+    plt.tight_layout()
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 # ---------------------- TELEGRAM ----------------------
+def send_photo(api_url, chat_id, photo_bytes, caption=""):
+    try:
+        files = {"photo": ("chart.png", photo_bytes, "image/png")}
+        data = {"chat_id": chat_id, "caption": caption[:1024], "parse_mode": "Markdown"}
+        requests.post(f"{api_url}/sendPhoto", data=data, files=files, timeout=15)
+    except Exception as e:
+        log.error(f"Błąd wysyłki zdjęcia Telegram: {e}")
+
+
 def send_message(api_url, chat_id, text):
     try:
         requests.post(f"{api_url}/sendMessage", data={
@@ -248,19 +421,28 @@ def main():
                 text = msg.get("text", "")
                 chat_id = msg.get("chat", {}).get("id")
                 if text and text.strip().lower() in ("/analiza", "/start", "/analysis"):
-                    reports = []
                     for symbol in SYMBOLS:
                         result = analyze_symbol(symbol)
-                        reports.append(format_report(result, symbol))
-                    send_message(api_url, chat_id, "\n\n---\n\n".join(reports))
+                        caption = format_report(result, symbol)
+                        try:
+                            chart = generate_chart(result, symbol)
+                            send_photo(api_url, chat_id, chart, caption=caption)
+                        except Exception as chart_err:
+                            log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
+                            send_message(api_url, chat_id, caption)
 
             # 2) Auto-alert jeśli sygnał jest mocny, osobno dla każdego symbolu
             for symbol in SYMBOLS:
                 result = analyze_symbol(symbol)
                 if result["score"] >= SIGNAL_THRESHOLD or result["score"] <= (100 - SIGNAL_THRESHOLD):
                     if result["score"] != last_auto_alert_score[symbol]:
-                        send_message(api_url, default_chat_id,
-                                     "🔥 *Mocny sygnał wykryty!*\n\n" + format_report(result, symbol))
+                        caption = "🔥 *Mocny sygnał wykryty!*\n\n" + format_report(result, symbol)
+                        try:
+                            chart = generate_chart(result, symbol)
+                            send_photo(api_url, default_chat_id, chart, caption=caption)
+                        except Exception as chart_err:
+                            log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
+                            send_message(api_url, default_chat_id, caption)
                         last_auto_alert_score[symbol] = result["score"]
 
         except Exception as e:
