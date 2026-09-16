@@ -1,64 +1,114 @@
 """
-ETH/USDT Signal Bot for Telegram
+ETH/BTC Signal Bot for Telegram
 ---------------------------------
-Pobiera świece z Binance (publiczne API, bez klucza), liczy wskaźniki
-techniczne (RSI, EMA, wolumen, formacje świecowe) i wysyła podsumowanie
-na Telegram — albo na żądanie (/analiza), albo automatycznie co interwał,
-jeśli wykryje mocny sygnał.
+Pobiera świece z Binance (publiczne API, bez klucza), analizuje wiele
+interwałów naraz, wykrywa Fair Value Gaps, sweepy płynności, strukturę
+rynku (HH/HL/LH/LL), poziomy 24h high/low, oraz proxy dla pozycjonowania
+dużych graczy (funding rate + open interest z rynku futures).
 
 WAŻNE: To są wskaźniki techniczne, nie gwarancja ani realna "szansa
-matematyczna" sukcesu. Traktuj to jako pomoc do własnej analizy, nie
-jako automatyczny sygnał do ślepego wejścia.
+matematyczna" sukcesu. Bot NIE wie co realnie robią konkretne duże firmy —
+funding rate i open interest to tylko pośrednie wskaźniki pozycjonowania
+całego rynku futures, nie insider info. Traktuj to jako pomoc do własnej
+analizy, nie jako automatyczny sygnał do ślepego wejścia.
 """
 
 import os
 import time
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("eth_bot")
 
-# ---------- KONFIGURACJA (z zmiennych środowiskowych) ----------
-# Wczytywane leniwie (dopiero w main()), żeby moduł dało się importować/testować
-# bez ustawionych zmiennych środowiskowych.
+# ---------- SESJA HTTP z automatycznym retry/backoff ----------
+# Chroni przed przejściowymi błędami sieci i rate-limitami (429) z Binance/Telegrama -
+# zamiast wywalać cały cykl, próbuje ponownie z rosnącym opóźnieniem.
+_session = requests.Session()
+_retry = Retry(
+    total=3, backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+)
+_session.mount("https://", HTTPAdapter(max_retries=_retry))
+_session.mount("http://", HTTPAdapter(max_retries=_retry))
+
+# ---------- KONFIGURACJA ----------
 SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "ETHUSDT,BTCUSDT").split(",")]
-INTERVAL = os.environ.get("INTERVAL", "30m")             # świece 30-minutowe
-CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "900"))  # co 15 min
-SIGNAL_THRESHOLD = int(os.environ.get("SIGNAL_THRESHOLD", "70"))  # od kiedy wysyłać auto-alert
+TIMEFRAMES = [s.strip() for s in os.environ.get("TIMEFRAMES", "15m,1h,4h").split(",")]
+CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "900"))
+# Auto-alert wysyłany gdy liczba zgodnych timeframe'ów >= próg (np. 2 z 3)
+CONFLUENCE_THRESHOLD = int(os.environ.get("CONFLUENCE_THRESHOLD", "2"))
+# Krótka pauza między requestami do Binance - dodatkowa ochrona przed rate-limitem
+REQUEST_PAUSE_SECONDS = float(os.environ.get("REQUEST_PAUSE_SECONDS", "0.3"))
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_24H_URL = "https://api.binance.com/api/v3/ticker/24hr"
+FUTURES_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
+FUTURES_OI_URL = "https://fapi.binance.com/futures/data/openInterestHist"
 
 
 def get_config():
-    """Wczytuje wymagane zmienne środowiskowe (dopiero gdy bot faktycznie startuje)."""
     token = os.environ["TELEGRAM_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     return token, chat_id, f"https://api.telegram.org/bot{token}"
 
 
 # ---------------------- DANE RYNKOWE ----------------------
-def get_klines(symbol, interval=INTERVAL, limit=100):
-    """Pobiera świece OHLCV z Binance (publiczne, bez klucza API)."""
+def get_klines(symbol, interval, limit=100):
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(BINANCE_KLINES_URL, params=params, timeout=10)
+    r = _session.get(BINANCE_KLINES_URL, params=params, timeout=10)
     r.raise_for_status()
     raw = r.json()
-    candles = []
-    for k in raw:
-        candles.append({
-            "open_time": k[0],
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5]),
-        })
-    return candles
+    return [{
+        "open_time": k[0], "open": float(k[1]), "high": float(k[2]),
+        "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+    } for k in raw]
 
 
-# ---------------------- WSKAŹNIKI ----------------------
+def get_24h_stats(symbol):
+    """Wysoki/niski poziom z ostatnich 24h - naturalne wsparcie/opór."""
+    r = _session.get(BINANCE_24H_URL, params={"symbol": symbol}, timeout=10)
+    r.raise_for_status()
+    d = r.json()
+    return {
+        "high": float(d["highPrice"]),
+        "low": float(d["lowPrice"]),
+        "change_pct": float(d["priceChangePercent"]),
+        "volume": float(d["volume"]),
+    }
+
+
+def get_futures_flow(symbol):
+    """Proxy dla pozycjonowania dużych graczy: funding rate + zmiana open interest.
+    UWAGA: to nie jest wgląd w konkretne transakcje firm, tylko zagregowany
+    wskaźnik z rynku kontraktów futures. Zwraca None jeśli dane niedostępne
+    (np. para nie ma kontraktów perpetual)."""
+    try:
+        r1 = _session.get(FUTURES_FUNDING_URL, params={"symbol": symbol, "limit": 1}, timeout=10)
+        r1.raise_for_status()
+        funding = float(r1.json()[-1]["fundingRate"]) * 100  # w %
+
+        r2 = _session.get(FUTURES_OI_URL,
+                           params={"symbol": symbol, "period": "1h", "limit": 8}, timeout=10)
+        r2.raise_for_status()
+        oi_data = r2.json()
+        if len(oi_data) >= 2:
+            oi_change_pct = ((float(oi_data[-1]["sumOpenInterest"]) - float(oi_data[0]["sumOpenInterest"]))
+                              / float(oi_data[0]["sumOpenInterest"]) * 100)
+        else:
+            oi_change_pct = None
+
+        return {"funding_rate_pct": funding, "oi_change_pct": oi_change_pct}
+    except Exception as e:
+        log.warning(f"Brak danych futures dla {symbol}: {e}")
+        return None
+
+
+# ---------------------- WSKAŹNIKI PODSTAWOWE ----------------------
 def ema(values, period):
     k = 2 / (period + 1)
     ema_vals = [values[0]]
@@ -83,62 +133,58 @@ def rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 
+def atr(candles, period=14):
+    if len(candles) < period + 1:
+        period = len(candles) - 1
+    trs = []
+    for i in range(1, len(candles)):
+        high, low, prev_close = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(trs[-period:]) / period if trs else 0
+
+
 def detect_candle_pattern(candles_window):
-    """Rozpoznaje formację świecową na bazie ostatnich 1-3 świec.
-    candles_window: lista świec, gdzie ostatnia (candles_window[-1]) to bieżąca."""
     candle = candles_window[-1]
     prev_candle = candles_window[-2]
-
     body = abs(candle["close"] - candle["open"])
     range_ = candle["high"] - candle["low"]
     if range_ == 0:
         return None
     upper_wick = candle["high"] - max(candle["close"], candle["open"])
     lower_wick = min(candle["close"], candle["open"]) - candle["low"]
-
     prev_body = abs(prev_candle["close"] - prev_candle["open"])
     prev_is_down = prev_candle["close"] < prev_candle["open"]
     prev_is_up = prev_candle["close"] > prev_candle["open"]
 
-    # --- Formacje 3-świecowe (sprawdzane najpierw, bo są bardziej specyficzne) ---
     if len(candles_window) >= 3:
         c1, c2, c3 = candles_window[-3], candles_window[-2], candles_window[-1]
         c1_body = abs(c1["close"] - c1["open"])
         c3_body = abs(c3["close"] - c3["open"])
-        # Morning Star: spadek, mała świeca (niezdecydowanie), silny wzrost
         if (c1["close"] < c1["open"] and c1_body > 0
                 and abs(c2["close"] - c2["open"]) < c1_body * 0.4
                 and c3["close"] > c3["open"] and c3_body > c1_body * 0.6
                 and c3["close"] > (c1["open"] + c1["close"]) / 2):
-            return "Morning Star (silne odbicie w górę)"
-        # Evening Star: wzrost, mała świeca, silny spadek
+            return "Morning Star"
         if (c1["close"] > c1["open"] and c1_body > 0
                 and abs(c2["close"] - c2["open"]) < c1_body * 0.4
                 and c3["close"] < c3["open"] and c3_body > c1_body * 0.6
                 and c3["close"] < (c1["open"] + c1["close"]) / 2):
-            return "Evening Star (silne odwrócenie w dół)"
+            return "Evening Star"
 
-    # --- Formacje 1-świecowe zależne od kontekstu (trend przed świecą) ---
     if body / range_ < 0.1:
-        return "Doji (niezdecydowanie)"
-
+        return "Doji"
     if lower_wick > body * 2 and upper_wick < body * 0.5:
-        # Długi dolny knot: Hammer (po spadku) lub Hanging Man (po wzroście)
         if prev_is_down:
-            return "Hammer (możliwe odbicie w górę)"
+            return "Hammer"
         elif prev_is_up:
-            return "Hanging Man (ostrzeżenie przed spadkiem)"
-        return "Pin bar / długi dolny knot"
-
+            return "Hanging Man"
+        return "Pin bar (dolny knot)"
     if upper_wick > body * 2 and lower_wick < body * 0.5:
-        # Długi górny knot: Shooting Star (po wzroście) lub Inverted Hammer (po spadku)
         if prev_is_up:
-            return "Shooting Star (ostrzeżenie przed spadkiem)"
+            return "Shooting Star"
         elif prev_is_down:
-            return "Inverted Hammer (możliwe odbicie w górę)"
-        return "Pin bar odwrócony / długi górny knot"
-
-    # --- Engulfing ---
+            return "Inverted Hammer"
+        return "Pin bar (górny knot)"
     if (candle["close"] > candle["open"] and prev_candle["close"] < prev_candle["open"]
             and candle["close"] > prev_candle["open"] and candle["open"] < prev_candle["close"]
             and body > prev_body):
@@ -150,20 +196,95 @@ def detect_candle_pattern(candles_window):
     return None
 
 
-def atr(candles, period=14):
-    """Average True Range - miara zmienności, używana do sugerowania SL/TP."""
-    if len(candles) < period + 1:
-        period = len(candles) - 1
-    trs = []
-    for i in range(1, len(candles)):
-        high, low, prev_close = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    return sum(trs[-period:]) / period if trs else 0
+BULLISH_PATTERNS = ("Hammer", "Bullish Engulfing", "Morning Star", "Inverted Hammer")
+BEARISH_PATTERNS = ("Bearish Engulfing", "Evening Star", "Shooting Star", "Hanging Man")
 
 
-# ---------------------- ANALIZA ----------------------
-def analyze(candles):
+# ---------------------- SMART MONEY CONCEPTS ----------------------
+def detect_fvg(candles, lookback=20):
+    """Fair Value Gap: luka między świecą 1 a świecą 3 (świeca 2 jej nie wypełnia).
+    Zwraca listę niedawnych, jeszcze niewypełnionych FVG."""
+    gaps = []
+    start = max(2, len(candles) - lookback)
+    for i in range(start, len(candles)):
+        c1, c3 = candles[i - 2], candles[i]
+        if c1["high"] < c3["low"]:
+            gap = {"type": "bullish", "top": c3["low"], "bottom": c1["high"], "index": i}
+        elif c1["low"] > c3["high"]:
+            gap = {"type": "bearish", "top": c1["low"], "bottom": c3["high"], "index": i}
+        else:
+            continue
+        filled = False
+        for later in candles[i + 1:]:
+            if gap["bottom"] <= later["close"] <= gap["top"]:
+                filled = True
+                break
+        if not filled:
+            gaps.append(gap)
+    return gaps[-3:]
+
+
+def detect_liquidity_sweep(candles, swing_lookback=15):
+    """Wykrywa sweep płynności: cena robi nowy ekstremum (wybija poprzedni
+    swing high/low knotem) po czym zamyka się z powrotem wewnątrz zakresu -
+    klasyczny 'stop hunt' zanim ruch odwróci się w drugą stronę."""
+    if len(candles) < swing_lookback + 2:
+        return None
+    last = candles[-1]
+    prior = candles[-(swing_lookback + 1):-1]
+    prior_high = max(c["high"] for c in prior)
+    prior_low = min(c["low"] for c in prior)
+
+    if last["high"] > prior_high and last["close"] < prior_high:
+        return {"type": "sweep_high", "level": prior_high}
+    if last["low"] < prior_low and last["close"] > prior_low:
+        return {"type": "sweep_low", "level": prior_low}
+    return None
+
+
+def find_swing_points(candles, window=3):
+    highs, lows = [], []
+    for i in range(window, len(candles) - window):
+        segment = candles[i - window:i + window + 1]
+        if candles[i]["high"] == max(c["high"] for c in segment):
+            highs.append((i, candles[i]["high"]))
+        if candles[i]["low"] == min(c["low"] for c in segment):
+            lows.append((i, candles[i]["low"]))
+    return highs, lows
+
+
+def market_structure(candles):
+    """HH+HL = struktura wzrostowa, LH+LL = struktura spadkowa, inaczej = mieszana."""
+    highs, lows = find_swing_points(candles)
+    if len(highs) < 2 or len(lows) < 2:
+        return {"structure": "brak wystarczających danych", "detail": "",
+                "hh": False, "hl": False, "lh": False, "ll": False}
+
+    last_two_highs = highs[-2:]
+    last_two_lows = lows[-2:]
+    hh = last_two_highs[1][1] > last_two_highs[0][1]
+    hl = last_two_lows[1][1] > last_two_lows[0][1]
+    lh = last_two_highs[1][1] < last_two_highs[0][1]
+    ll = last_two_lows[1][1] < last_two_lows[0][1]
+
+    if hh and hl:
+        structure = "wzrostowa (Higher High + Higher Low)"
+    elif lh and ll:
+        structure = "spadkowa (Lower High + Lower Low)"
+    elif hh and ll:
+        structure = "rozszerzająca się zmienność (Higher High + Lower Low)"
+    elif lh and hl:
+        structure = "zwężający się range (Lower High + Higher Low)"
+    else:
+        structure = "mieszana / bez wyraźnego kierunku"
+
+    detail = (f"Ostatnie swingi — High: {last_two_highs[0][1]:.2f} → {last_two_highs[1][1]:.2f}, "
+              f"Low: {last_two_lows[0][1]:.2f} → {last_two_lows[1][1]:.2f}")
+    return {"structure": structure, "detail": detail, "hh": hh, "hl": hl, "lh": lh, "ll": ll}
+
+
+# ---------------------- ANALIZA JEDNEGO TIMEFRAME ----------------------
+def analyze_timeframe(candles):
     closes = [c["close"] for c in candles]
     volumes = [c["volume"] for c in candles]
 
@@ -171,159 +292,211 @@ def analyze(candles):
     ema50 = ema(closes, 50) if len(closes) >= 50 else ema(closes, len(closes) - 1)
     current_price = closes[-1]
     current_rsi = rsi(closes)
-
-    avg_volume = sum(volumes[-20:]) / min(20, len(volumes))
-    current_volume = volumes[-1]
-    volume_ratio = current_volume / avg_volume if avg_volume else 1
-
-    # Trend na podstawie EMA (to jest OPÓŹNIONE - może się mylić przy świeżym zwrocie)
-    trend = "wzrostowy" if ema20[-1] > ema50[-1] else "spadkowy"
-    trend_strength = abs(ema20[-1] - ema50[-1]) / current_price * 100
-
-    pattern = detect_candle_pattern(candles[-3:] if len(candles) >= 3 else candles[-2:])
     current_atr = atr(candles)
 
-    # Zmiana ceny za noc / ostatnie N świec (np. ostatnie 16 świec 30m = ~8h)
-    lookback = min(16, len(closes) - 1)
-    overnight_change_pct = (closes[-1] - closes[-1 - lookback]) / closes[-1 - lookback] * 100
+    avg_volume = sum(volumes[-20:]) / min(20, len(volumes))
+    volume_ratio = volumes[-1] / avg_volume if avg_volume else 1
 
-    # ---- NOWE: świeże momentum z ostatnich 3-4 świec (żeby złapać zwrot zanim EMA go zauważy) ----
+    trend = "wzrostowy" if ema20[-1] > ema50[-1] else "spadkowy"
+    pattern = detect_candle_pattern(candles[-3:] if len(candles) >= 3 else candles[-2:])
+
     recent_n = min(4, len(closes) - 1)
     recent_closes = closes[-(recent_n + 1):]
     recent_change_pct = (recent_closes[-1] - recent_closes[0]) / recent_closes[0] * 100
-    # czy ostatnie świece konsekwentnie spadają / rosną
     recent_diffs = [recent_closes[i + 1] - recent_closes[i] for i in range(len(recent_closes) - 1)]
     falling_streak = all(d < 0 for d in recent_diffs)
     rising_streak = all(d > 0 for d in recent_diffs)
 
-    # ---- Prosty composite "signal score" (0-100), NIE prawdziwe prawdopodobieństwo ----
-    score = 50
-    direction = "neutralny"
+    structure = market_structure(candles)
+    fvgs = detect_fvg(candles)
+    sweep = detect_liquidity_sweep(candles)
+
+    bullish_votes, bearish_votes = [], []
 
     if trend == "wzrostowy":
-        score += 10
+        bullish_votes.append("EMA20>EMA50")
     else:
-        score -= 10
+        bearish_votes.append("EMA20<EMA50")
 
     if current_rsi is not None:
         if current_rsi < 30:
-            score += 15  # wyprzedanie -> możliwe odbicie w górę
-            direction = "long"
+            bullish_votes.append(f"RSI wyprzedany ({current_rsi:.0f})")
         elif current_rsi > 70:
-            score -= 15  # wykupienie -> możliwa korekta w dół
-            direction = "short"
+            bearish_votes.append(f"RSI wykupiony ({current_rsi:.0f})")
 
-    if volume_ratio > 1.5:
-        score += 10 if trend == "wzrostowy" else -10
+    if pattern in BULLISH_PATTERNS:
+        bullish_votes.append(f"formacja {pattern}")
+    elif pattern in BEARISH_PATTERNS:
+        bearish_votes.append(f"formacja {pattern}")
 
-    # Klasyfikacja formacji świecowej: bycza / niedźwiedzia / ostrzegawcza
-    bullish_patterns = ("Hammer", "Bullish Engulfing", "Morning Star", "Inverted Hammer")
-    bearish_patterns = ("Bearish Engulfing", "Evening Star", "Shooting Star", "Hanging Man")
-    if pattern and any(p in pattern for p in bullish_patterns):
-        score += 10
-        direction = "long"
-    if pattern and any(p in pattern for p in bearish_patterns):
-        score -= 10
-        direction = "short"
-
-    # ---- NOWE: świeże momentum ma DUŻĄ wagę - przebija opóźnione EMA ----
-    momentum_override = None
     if falling_streak and abs(recent_change_pct) > 0.3:
-        score -= 20
-        momentum_override = "short"
+        bearish_votes.append("świeże momentum spadkowe")
     elif rising_streak and abs(recent_change_pct) > 0.3:
-        score += 20
-        momentum_override = "long"
+        bullish_votes.append("świeże momentum wzrostowe")
 
-    score = max(0, min(100, score))
+    if structure.get("hh") and structure.get("hl"):
+        bullish_votes.append("struktura HH+HL")
+    elif structure.get("lh") and structure.get("ll"):
+        bearish_votes.append("struktura LH+LL")
 
-    # Kierunek finalny: świeże momentum ma pierwszeństwo nad opóźnionym trendem EMA
-    if momentum_override:
-        direction = momentum_override
-    elif direction == "neutralny":
-        # Podniesiony próg (był >55/<45) - score blisko środka = szczerze "neutralny", nie fałszywy sygnał
-        direction = "long" if score >= 65 else ("short" if score <= 35 else "neutralny")
+    if sweep:
+        if sweep["type"] == "sweep_low":
+            bullish_votes.append(f"sweep dołu @ {sweep['level']:.2f} (możliwe odbicie)")
+        else:
+            bearish_votes.append(f"sweep szczytu @ {sweep['level']:.2f} (możliwa korekta)")
 
-    # ---- Sugerowane poziomy entry/SL/TP na bazie ATR (miara zmienności) ----
-    # To orientacyjne poziomy, nie rekomendacja - zawsze weryfikuj samodzielnie.
-    entry_zone = None
-    stop_loss = None
-    take_profit_1 = None
-    take_profit_2 = None
-    if direction == "long":
-        entry_zone = (current_price - current_atr * 0.3, current_price)
-        stop_loss = current_price - current_atr * 1.5
-        take_profit_1 = current_price + current_atr * 1.5
-        take_profit_2 = current_price + current_atr * 3
-    elif direction == "short":
-        entry_zone = (current_price, current_price + current_atr * 0.3)
-        stop_loss = current_price + current_atr * 1.5
-        take_profit_1 = current_price - current_atr * 1.5
-        take_profit_2 = current_price - current_atr * 3
+    for gap in fvgs:
+        if gap["type"] == "bullish":
+            bullish_votes.append(f"niewypełniony bullish FVG {gap['bottom']:.2f}-{gap['top']:.2f}")
+        else:
+            bearish_votes.append(f"niewypełniony bearish FVG {gap['bottom']:.2f}-{gap['top']:.2f}")
+
+    if len(bullish_votes) > len(bearish_votes):
+        bias = "long"
+    elif len(bearish_votes) > len(bullish_votes):
+        bias = "short"
+    else:
+        bias = "neutralny"
 
     return {
-        "price": current_price,
-        "trend": trend,
-        "trend_strength": trend_strength,
-        "rsi": current_rsi,
-        "volume_ratio": volume_ratio,
-        "pattern": pattern,
-        "atr": current_atr,
-        "overnight_change_pct": overnight_change_pct,
-        "recent_change_pct": recent_change_pct,
-        "momentum_warning": momentum_override,
-        "score": score,
-        "direction": direction,
-        "entry_zone": entry_zone,
-        "stop_loss": stop_loss,
-        "take_profit_1": take_profit_1,
-        "take_profit_2": take_profit_2,
-        "candles": candles,  # potrzebne do wygenerowania wykresu
+        "price": current_price, "atr": current_atr, "rsi": current_rsi,
+        "trend": trend, "volume_ratio": volume_ratio, "pattern": pattern,
+        "structure": structure, "fvgs": fvgs, "sweep": sweep,
+        "bullish_votes": bullish_votes, "bearish_votes": bearish_votes,
+        "bias": bias, "candles": candles,
     }
 
 
-def format_report(a, symbol):
+# ---------------------- ANALIZA WIELO-INTERWAŁOWA ----------------------
+def analyze_symbol(symbol):
+    per_tf = {}
+    for tf in TIMEFRAMES:
+        try:
+            candles = get_klines(symbol, tf)
+            per_tf[tf] = analyze_timeframe(candles)
+        except Exception as e:
+            log.warning(f"Pominięto timeframe {tf} dla {symbol} (błąd: {e})")
+        time.sleep(REQUEST_PAUSE_SECONDS)
+
+    if not per_tf:
+        raise RuntimeError(f"Nie udało się pobrać żadnego timeframe'u dla {symbol}")
+
+    active_timeframes = list(per_tf.keys())
+
+    stats_24h = None
+    try:
+        stats_24h = get_24h_stats(symbol)
+    except Exception as e:
+        log.warning(f"Brak danych 24h dla {symbol}: {e}")
+
+    flow = get_futures_flow(symbol)
+
+    biases = [per_tf[tf]["bias"] for tf in active_timeframes]
+    long_count = biases.count("long")
+    short_count = biases.count("short")
+    if long_count >= CONFLUENCE_THRESHOLD and long_count > short_count:
+        overall_bias = "long"
+    elif short_count >= CONFLUENCE_THRESHOLD and short_count > long_count:
+        overall_bias = "short"
+    else:
+        overall_bias = "mieszany / brak zgodności"
+
+    base_tf_name = active_timeframes[0]
+    base_tf = per_tf[base_tf_name]
+    entry_zone = stop_loss = tp1 = tp2 = None
+    if overall_bias == "long":
+        p, a_ = base_tf["price"], base_tf["atr"]
+        entry_zone = (p - a_ * 0.3, p)
+        stop_loss = p - a_ * 1.5
+        tp1, tp2 = p + a_ * 1.5, p + a_ * 3
+    elif overall_bias == "short":
+        p, a_ = base_tf["price"], base_tf["atr"]
+        entry_zone = (p, p + a_ * 0.3)
+        stop_loss = p + a_ * 1.5
+        tp1, tp2 = p - a_ * 1.5, p - a_ * 3
+
+    return {
+        "symbol": symbol, "per_tf": per_tf, "active_timeframes": active_timeframes,
+        "stats_24h": stats_24h, "flow": flow,
+        "overall_bias": overall_bias, "long_count": long_count, "short_count": short_count,
+        "entry_zone": entry_zone, "stop_loss": stop_loss, "tp1": tp1, "tp2": tp2,
+        "base_tf": base_tf_name,
+    }
+
+
+# ---------------------- RAPORT TEKSTOWY ----------------------
+def format_report(r):
+    symbol = r["symbol"]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [
-        f"📊 *{symbol}* — {now}",
-        f"Cena: `{a['price']:.2f}`",
-        f"Trend (EMA20 vs EMA50): *{a['trend']}* (siła: {a['trend_strength']:.2f}%) [wskaźnik opóźniony]",
-        f"RSI(14): {a['rsi']:.1f}" if a["rsi"] else "RSI: brak danych",
-        f"Wolumen vs średnia(20): {a['volume_ratio']:.2f}x",
-        f"Zmiana za ostatnie ~8h: {a['overnight_change_pct']:+.2f}%",
-        f"Świeże momentum (ostatnie świece): {a['recent_change_pct']:+.2f}%",
-    ]
-    if a.get("momentum_warning"):
-        lines.append(f"⚠️ Świeże momentum ({a['momentum_warning'].upper()}) przebija opóźniony trend EMA!")
-    if a["pattern"]:
-        lines.append(f"Formacja świecowa: {a['pattern']}")
+    lines = [f"📊 *{symbol}* — {now}", ""]
+
+    if r["stats_24h"]:
+        s = r["stats_24h"]
+        lines.append(f"24h High: `{s['high']:.2f}`  |  24h Low: `{s['low']:.2f}`  ({s['change_pct']:+.2f}%)")
+
+    if r["flow"]:
+        f = r["flow"]
+        oi_txt = f"  |  OI (8h): {f['oi_change_pct']:+.2f}%" if f["oi_change_pct"] is not None else ""
+        lines.append(f"Funding rate: {f['funding_rate_pct']:+.4f}%{oi_txt}")
+        if f["funding_rate_pct"] > 0.03:
+            lines.append("  → wysoki dodatni funding: dużo pozycji long na dźwigni, ryzyko korekty")
+        elif f["funding_rate_pct"] < -0.03:
+            lines.append("  → wysoki ujemny funding: dużo pozycji short, ryzyko short squeeze")
+        if f["oi_change_pct"] is not None and abs(f["oi_change_pct"]) > 5:
+            hint = "napływa nowy kapitał" if f["oi_change_pct"] > 0 else "pozycje są zamykane"
+            lines.append(f"  → open interest zmienił się o {f['oi_change_pct']:+.1f}% — {hint}")
+
     lines.append("")
-    lines.append(f"🎯 Signal score: *{a['score']}/100* → kierunek: *{a['direction'].upper()}*")
-    if a["direction"] in ("long", "short") and a["entry_zone"]:
+    for tf in r["active_timeframes"]:
+        d = r["per_tf"][tf]
+        rsi_txt = f"{d['rsi']:.0f}" if d["rsi"] else "brak"
+        lines.append(f"— *{tf}* — cena {d['price']:.2f} | trend {d['trend']} | RSI {rsi_txt}")
+        lines.append(f"   Struktura: {d['structure']['structure']}")
+        if d["sweep"]:
+            sweep_txt = "sweep dołu" if d["sweep"]["type"] == "sweep_low" else "sweep szczytu"
+            lines.append(f"   ⚡ {sweep_txt} @ {d['sweep']['level']:.2f}")
+        if d["fvgs"]:
+            for g in d["fvgs"]:
+                lines.append(f"   FVG {g['type']}: {g['bottom']:.2f}-{g['top']:.2f} (niewypełniony)")
+        if d["pattern"]:
+            lines.append(f"   Formacja: {d['pattern']}")
+        lines.append(f"   Bias {tf}: *{d['bias'].upper()}*")
+
+    lines.append("")
+    lines.append(f"🧭 Zgodność timeframe'ów: {r['long_count']} long / {r['short_count']} short "
+                  f"(z {len(r['active_timeframes'])})")
+    lines.append(f"➡️ Ogólny kierunek: *{r['overall_bias'].upper()}*")
+
+    if r["entry_zone"]:
         lines.append("")
-        lines.append(f"📍 Orientacyjne poziomy (ATR={a['atr']:.2f}):")
-        lines.append(f"   Entry: `{a['entry_zone'][0]:.2f} - {a['entry_zone'][1]:.2f}`")
-        lines.append(f"   SL: `{a['stop_loss']:.2f}`")
-        lines.append(f"   TP1: `{a['take_profit_1']:.2f}`  TP2: `{a['take_profit_2']:.2f}`")
-    lines.append("_To wskaźnik techniczny, nie gwarancja. Zawsze rób własny research._")
+        lines.append(f"📍 Orientacyjne poziomy (na bazie {r['base_tf']}):")
+        lines.append(f"   Entry: `{r['entry_zone'][0]:.2f} - {r['entry_zone'][1]:.2f}`")
+        lines.append(f"   SL: `{r['stop_loss']:.2f}`")
+        lines.append(f"   TP1: `{r['tp1']:.2f}`  TP2: `{r['tp2']:.2f}`")
+
+    lines.append("")
+    lines.append("_Wskaźniki techniczne, nie gwarancja. Funding/OI to zagregowane dane rynku "
+                  "futures, nie wgląd w konkretne transakcje firm. Zawsze rób własny research._")
     return "\n".join(lines)
 
 
 # ---------------------- WYKRES ----------------------
-def generate_chart(a, symbol, n_candles=40):
-    """Rysuje wykres świecowy (ostatnie n_candles) + wolumen + poziomy entry/SL/TP.
-    Zwraca bytes PNG gotowe do wysłania na Telegram."""
+def generate_chart(r, n_candles=50):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
     from io import BytesIO
 
-    candles = a["candles"][-n_candles:]
+    symbol = r["symbol"]
+    base_tf = r["base_tf"]
+    d = r["per_tf"][base_tf]
+    candles = d["candles"][-n_candles:]
+    offset = len(d["candles"]) - len(candles)
+
     fig, (ax_price, ax_vol) = plt.subplots(
-        2, 1, figsize=(10, 6), sharex=True,
-        gridspec_kw={"height_ratios": [3, 1]},
-        facecolor="#0d1117"
+        2, 1, figsize=(11, 6.5), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]}, facecolor="#0d1117"
     )
     for ax in (ax_price, ax_vol):
         ax.set_facecolor("#0d1117")
@@ -333,28 +506,39 @@ def generate_chart(a, symbol, n_candles=40):
 
     up_color, down_color = "#26a69a", "#ef5350"
     width = 0.6
-
     for i, c in enumerate(candles):
         color = up_color if c["close"] >= c["open"] else down_color
-        # knot
         ax_price.plot([i, i], [c["low"], c["high"]], color=color, linewidth=1)
-        # korpus
         body_low = min(c["open"], c["close"])
         body_height = abs(c["close"] - c["open"]) or (c["high"] - c["low"]) * 0.01
         ax_price.add_patch(Rectangle((i - width / 2, body_low), width, body_height,
                                       facecolor=color, edgecolor=color))
-        # wolumen
         ax_vol.bar(i, c["volume"], color=color, width=width)
 
-    # Linie entry / SL / TP
-    if a["direction"] in ("long", "short") and a["entry_zone"]:
-        ax_price.axhline(a["stop_loss"], color="#ef5350", linestyle="--", linewidth=1, label="SL")
-        ax_price.axhline(a["take_profit_1"], color="#26a69a", linestyle="--", linewidth=1, label="TP1")
-        ax_price.axhline(a["take_profit_2"], color="#26a69a", linestyle=":", linewidth=1, label="TP2")
-        ax_price.axhspan(a["entry_zone"][0], a["entry_zone"][1], color="#f0b90b", alpha=0.15)
-        ax_price.legend(loc="upper left", facecolor="#0d1117", labelcolor="#c9d1d9", framealpha=0.7)
+    for gap in d["fvgs"]:
+        idx = gap["index"] - offset
+        if idx < 0:
+            continue
+        color = "#26a69a" if gap["type"] == "bullish" else "#ef5350"
+        ax_price.axhspan(gap["bottom"], gap["top"], xmin=max(0, idx - 2) / len(candles),
+                          color=color, alpha=0.12)
 
-    ax_price.set_title(f"{symbol} — score {a['score']}/100 ({a['direction'].upper()})",
+    if r["stats_24h"]:
+        ax_price.axhline(r["stats_24h"]["high"], color="#f0b90b", linestyle="-",
+                          linewidth=1, alpha=0.6, label="24h High")
+        ax_price.axhline(r["stats_24h"]["low"], color="#f0b90b", linestyle="-",
+                          linewidth=1, alpha=0.6, label="24h Low")
+
+    if r["entry_zone"]:
+        ax_price.axhline(r["stop_loss"], color="#ef5350", linestyle="--", linewidth=1, label="SL")
+        ax_price.axhline(r["tp1"], color="#26a69a", linestyle="--", linewidth=1, label="TP1")
+        ax_price.axhline(r["tp2"], color="#26a69a", linestyle=":", linewidth=1, label="TP2")
+        ax_price.axhspan(r["entry_zone"][0], r["entry_zone"][1], color="#8e5cf7", alpha=0.15)
+
+    ax_price.legend(loc="upper left", facecolor="#0d1117", labelcolor="#c9d1d9",
+                     framealpha=0.7, fontsize=8)
+    ax_price.set_title(f"{symbol} ({base_tf}) — {r['overall_bias'].upper()} "
+                        f"[{r['long_count']}L/{r['short_count']}S]",
                         color="#c9d1d9", fontsize=12)
     ax_vol.set_xlabel("Świece (najnowsza po prawej)", color="#c9d1d9")
     plt.tight_layout()
@@ -367,22 +551,44 @@ def generate_chart(a, symbol, n_candles=40):
 
 
 # ---------------------- TELEGRAM ----------------------
+def _check_telegram_response(r, context):
+    """Sprawdza odpowiedź Telegrama; zwraca True jeśli sukces, loguje szczegóły błędu jeśli nie."""
+    try:
+        data = r.json()
+    except ValueError:
+        log.error(f"Telegram ({context}): niepoprawna odpowiedź, status {r.status_code}")
+        return False
+    if not data.get("ok"):
+        log.error(f"Telegram ({context}) błąd: {data.get('description')}")
+        return False
+    return True
+
+
 def send_photo(api_url, chat_id, photo_bytes, caption=""):
     try:
         files = {"photo": ("chart.png", photo_bytes, "image/png")}
         data = {"chat_id": chat_id, "caption": caption[:1024], "parse_mode": "Markdown"}
-        requests.post(f"{api_url}/sendPhoto", data=data, files=files, timeout=15)
+        r = _session.post(f"{api_url}/sendPhoto", data=data, files=files, timeout=15)
+        if not _check_telegram_response(r, "sendPhoto"):
+            # Fallback: mogło paść na złym Markdown (np. obcięty caption) - spróbuj bez formatowania
+            photo_bytes.seek(0)
+            files = {"photo": ("chart.png", photo_bytes, "image/png")}
+            data = {"chat_id": chat_id, "caption": caption[:1024]}
+            _session.post(f"{api_url}/sendPhoto", data=data, files=files, timeout=15)
+        if len(caption) > 1024:
+            send_message(api_url, chat_id, caption[1024:])
     except Exception as e:
         log.error(f"Błąd wysyłki zdjęcia Telegram: {e}")
 
 
 def send_message(api_url, chat_id, text):
     try:
-        requests.post(f"{api_url}/sendMessage", data={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown",
+        r = _session.post(f"{api_url}/sendMessage", data={
+            "chat_id": chat_id, "text": text, "parse_mode": "Markdown",
         }, timeout=10)
+        if not _check_telegram_response(r, "sendMessage"):
+            # Fallback bez Markdown, gdyby formatowanie było niepoprawne
+            _session.post(f"{api_url}/sendMessage", data={"chat_id": chat_id, "text": text}, timeout=10)
     except Exception as e:
         log.error(f"Błąd wysyłki Telegram: {e}")
 
@@ -391,29 +597,23 @@ def get_updates(api_url, offset=None):
     params = {"timeout": 20}
     if offset:
         params["offset"] = offset
-    r = requests.get(f"{api_url}/getUpdates", params=params, timeout=25)
+    r = _session.get(f"{api_url}/getUpdates", params=params, timeout=25)
     return r.json().get("result", [])
 
 
 # ---------------------- GŁÓWNA PĘTLA ----------------------
-def analyze_symbol(symbol):
-    candles = get_klines(symbol)
-    return analyze(candles)
-
-
 def main():
     token, default_chat_id, api_url = get_config()
-    log.info(f"Bot startuje... obserwowane symbole: {SYMBOLS}")
+    log.info(f"Bot startuje... symbole: {SYMBOLS}, timeframes: {TIMEFRAMES}")
     last_update_id = None
-    last_auto_alert_score = {s: None for s in SYMBOLS}
+    last_auto_alert_bias = {s: None for s in SYMBOLS}
 
     send_message(api_url, default_chat_id,
-                 f"🤖 Bot wystartował. Śledzę: {', '.join(SYMBOLS)}. "
+                 f"🤖 Bot wystartował. Śledzę: {', '.join(SYMBOLS)} na {', '.join(TIMEFRAMES)}. "
                  f"Wpisz /analiza żeby dostać raport na żądanie.")
 
     while True:
         try:
-            # 1) Sprawdź komendy od użytkownika
             updates = get_updates(api_url, offset=last_update_id)
             for u in updates:
                 last_update_id = u["update_id"] + 1
@@ -422,28 +622,29 @@ def main():
                 chat_id = msg.get("chat", {}).get("id")
                 if text and text.strip().lower() in ("/analiza", "/start", "/analysis"):
                     for symbol in SYMBOLS:
-                        result = analyze_symbol(symbol)
-                        caption = format_report(result, symbol)
+                        r = analyze_symbol(symbol)
+                        caption = format_report(r)
                         try:
-                            chart = generate_chart(result, symbol)
+                            chart = generate_chart(r)
                             send_photo(api_url, chat_id, chart, caption=caption)
                         except Exception as chart_err:
                             log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
                             send_message(api_url, chat_id, caption)
 
-            # 2) Auto-alert jeśli sygnał jest mocny, osobno dla każdego symbolu
             for symbol in SYMBOLS:
-                result = analyze_symbol(symbol)
-                if result["score"] >= SIGNAL_THRESHOLD or result["score"] <= (100 - SIGNAL_THRESHOLD):
-                    if result["score"] != last_auto_alert_score[symbol]:
-                        caption = "🔥 *Mocny sygnał wykryty!*\n\n" + format_report(result, symbol)
+                r = analyze_symbol(symbol)
+                if r["overall_bias"] in ("long", "short"):
+                    if r["overall_bias"] != last_auto_alert_bias[symbol]:
+                        caption = "🔥 *Zgodność timeframe'ów wykryta!*\n\n" + format_report(r)
                         try:
-                            chart = generate_chart(result, symbol)
+                            chart = generate_chart(r)
                             send_photo(api_url, default_chat_id, chart, caption=caption)
                         except Exception as chart_err:
                             log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
                             send_message(api_url, default_chat_id, caption)
-                        last_auto_alert_score[symbol] = result["score"]
+                        last_auto_alert_bias[symbol] = r["overall_bias"]
+                else:
+                    last_auto_alert_bias[symbol] = None
 
         except Exception as e:
             log.error(f"Błąd w pętli głównej: {e}")
