@@ -767,8 +767,19 @@ def run_backtest(api_url, chat_id):
 def main():
     token, default_chat_id, api_url = get_config()
     log.info(f"Bot startuje... symbole: {SYMBOLS}, timeframes: {TIMEFRAMES}")
-    last_update_id = None
     last_auto_alert_bias = {s: None for s in SYMBOLS}
+
+    # WAŻNE: wyczyść zaległe update'y z Telegrama sprzed restartu (long polling nie
+    # pamięta stanu między restartami procesu) - inaczej bot odtwarza stare
+    # wiadomości/kliknięcia przycisków i wysyła kilka wiadomości naraz po starcie.
+    try:
+        stale_updates = get_updates(api_url)
+        last_update_id = stale_updates[-1]["update_id"] + 1 if stale_updates else None
+        if stale_updates:
+            log.info(f"Pominięto {len(stale_updates)} zaległych update'ów sprzed restartu")
+    except Exception as e:
+        log.warning(f"Nie udało się wyczyścić zaległych update'ów: {e}")
+        last_update_id = None
 
     send_message(api_url, default_chat_id,
                  "🤖 Cześć! Co potrzebujesz?", reply_markup=main_menu_keyboard())
