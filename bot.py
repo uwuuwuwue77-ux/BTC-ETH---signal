@@ -58,8 +58,10 @@ def get_config():
 
 
 # ---------------------- DANE RYNKOWE ----------------------
-def get_klines(symbol, interval, limit=100):
+def get_klines(symbol, interval, limit=100, start_time=None):
     params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if start_time is not None:
+        params["startTime"] = start_time
     r = _session.get(BINANCE_KLINES_URL, params=params, timeout=10)
     r.raise_for_status()
     raw = r.json()
@@ -424,59 +426,49 @@ def analyze_symbol(symbol):
     }
 
 
-# ---------------------- RAPORT TEKSTOWY ----------------------
+# ---------------------- RAPORT TEKSTOWY (zwięzły) ----------------------
+_BIAS_EMOJI = {"long": "🟢", "short": "🔴", "neutralny": "⚪"}
+
+
 def format_report(r):
     symbol = r["symbol"]
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"📊 *{symbol}* — {now}", ""]
+    base = r["per_tf"][r["base_tf"]]
+    price = base["price"]
+
+    change_txt = f" ({r['stats_24h']['change_pct']:+.1f}%)" if r["stats_24h"] else ""
+    lines = [f"📊 *{symbol}*  `{price:.2f}`{change_txt}"]
 
     if r["stats_24h"]:
         s = r["stats_24h"]
-        lines.append(f"24h High: `{s['high']:.2f}`  |  24h Low: `{s['low']:.2f}`  ({s['change_pct']:+.2f}%)")
+        lines.append(f"24h: {s['low']:.0f} — {s['high']:.0f}")
 
-    if r["flow"]:
-        f = r["flow"]
-        oi_txt = f"  |  OI (8h): {f['oi_change_pct']:+.2f}%" if f["oi_change_pct"] is not None else ""
-        lines.append(f"Funding rate: {f['funding_rate_pct']:+.4f}%{oi_txt}")
-        if f["funding_rate_pct"] > 0.03:
-            lines.append("  → wysoki dodatni funding: dużo pozycji long na dźwigni, ryzyko korekty")
-        elif f["funding_rate_pct"] < -0.03:
-            lines.append("  → wysoki ujemny funding: dużo pozycji short, ryzyko short squeeze")
-        if f["oi_change_pct"] is not None and abs(f["oi_change_pct"]) > 5:
-            hint = "napływa nowy kapitał" if f["oi_change_pct"] > 0 else "pozycje są zamykane"
-            lines.append(f"  → open interest zmienił się o {f['oi_change_pct']:+.1f}% — {hint}")
+    # Jedna linia na timeframe: emoji + kierunek
+    tf_line = " | ".join(f"{tf} {_BIAS_EMOJI[r['per_tf'][tf]['bias']]}"
+                          for tf in r["active_timeframes"])
+    lines.append(tf_line)
+    lines.append(f"➡️ *{r['overall_bias'].upper()}* ({r['long_count']}L/{r['short_count']}S)")
 
-    lines.append("")
+    # Tylko najważniejsze, konkretne sygnały - nie wszystko ze wszystkich timeframe'ów
+    highlights = []
     for tf in r["active_timeframes"]:
         d = r["per_tf"][tf]
-        rsi_txt = f"{d['rsi']:.0f}" if d["rsi"] else "brak"
-        lines.append(f"— *{tf}* — cena {d['price']:.2f} | trend {d['trend']} | RSI {rsi_txt}")
-        lines.append(f"   Struktura: {d['structure']['structure']}")
         if d["sweep"]:
             sweep_txt = "sweep dołu" if d["sweep"]["type"] == "sweep_low" else "sweep szczytu"
-            lines.append(f"   ⚡ {sweep_txt} @ {d['sweep']['level']:.2f}")
-        if d["fvgs"]:
-            for g in d["fvgs"]:
-                lines.append(f"   FVG {g['type']}: {g['bottom']:.2f}-{g['top']:.2f} (niewypełniony)")
-        if d["pattern"]:
-            lines.append(f"   Formacja: {d['pattern']}")
-        lines.append(f"   Bias {tf}: *{d['bias'].upper()}*")
+            highlights.append(f"⚡ {sweep_txt} {tf} @{d['sweep']['level']:.0f}")
+        if d["pattern"] and (d["pattern"] in BULLISH_PATTERNS or d["pattern"] in BEARISH_PATTERNS):
+            highlights.append(f"🕯️ {d['pattern']} ({tf})")
+    if highlights:
+        lines.append(" · ".join(highlights[:3]))  # max 3, żeby nie zaśmiecać
 
-    lines.append("")
-    lines.append(f"🧭 Zgodność timeframe'ów: {r['long_count']} long / {r['short_count']} short "
-                  f"(z {len(r['active_timeframes'])})")
-    lines.append(f"➡️ Ogólny kierunek: *{r['overall_bias'].upper()}*")
+    if r["flow"] and (r["flow"]["funding_rate_pct"] > 0.03 or r["flow"]["funding_rate_pct"] < -0.03):
+        f = r["flow"]
+        tag = "long-heavy⚠️" if f["funding_rate_pct"] > 0 else "short-heavy⚠️"
+        lines.append(f"💰 Funding {f['funding_rate_pct']:+.3f}% ({tag})")
 
     if r["entry_zone"]:
-        lines.append("")
-        lines.append(f"📍 Orientacyjne poziomy (na bazie {r['base_tf']}):")
-        lines.append(f"   Entry: `{r['entry_zone'][0]:.2f} - {r['entry_zone'][1]:.2f}`")
-        lines.append(f"   SL: `{r['stop_loss']:.2f}`")
-        lines.append(f"   TP1: `{r['tp1']:.2f}`  TP2: `{r['tp2']:.2f}`")
+        lines.append(f"🎯 Entry `{r['entry_zone'][0]:.0f}-{r['entry_zone'][1]:.0f}` "
+                      f"SL `{r['stop_loss']:.0f}` TP `{r['tp1']:.0f}/{r['tp2']:.0f}`")
 
-    lines.append("")
-    lines.append("_Wskaźniki techniczne, nie gwarancja. Funding/OI to zagregowane dane rynku "
-                  "futures, nie wgląd w konkretne transakcje firm. Zawsze rób własny research._")
     return "\n".join(lines)
 
 
@@ -550,6 +542,142 @@ def generate_chart(r, n_candles=50):
     return buf
 
 
+# ---------------------- BACKTEST / TRACKING SKUTECZNOŚCI ----------------------
+# Bot zapisuje każdy wygenerowany sygnał (long/short) i w tle sprawdza, czy cena
+# po drodze dotknęła SL czy TP. Komenda /backtest pokazuje statystyki.
+#
+# UWAGA: dane trzymane są w lokalnym pliku JSON. Na platformach typu Railway/Render
+# bez podpiętego trwałego wolumenu dysk jest ulotny - redeploy/restart wyczyści
+# historię. Wystarczy to jednak, żeby zbierać statystyki między restartami.
+import json
+
+TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trades.json")
+
+
+def _load_trades():
+    if not os.path.exists(TRADE_LOG_PATH):
+        return []
+    try:
+        with open(TRADE_LOG_PATH, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        log.error(f"Błąd odczytu {TRADE_LOG_PATH}: {e}")
+        return []
+
+
+def _save_trades(trades):
+    try:
+        with open(TRADE_LOG_PATH, "w") as f:
+            json.dump(trades, f, indent=2)
+    except Exception as e:
+        log.error(f"Błąd zapisu {TRADE_LOG_PATH}: {e}")
+
+
+def record_signal(r):
+    """Zapisuje nowy sygnał (long/short) do historii backtestu."""
+    if r["overall_bias"] not in ("long", "short") or not r["entry_zone"]:
+        return
+    trades = _load_trades()
+    trades.append({
+        "symbol": r["symbol"],
+        "direction": r["overall_bias"],
+        "timeframe": r["base_tf"],
+        "entry_time_ms": int(time.time() * 1000),
+        "entry_price": r["per_tf"][r["base_tf"]]["price"],
+        "stop_loss": r["stop_loss"],
+        "tp1": r["tp1"],
+        "tp2": r["tp2"],
+        "status": "open",
+        "closed_at_ms": None,
+    })
+    _save_trades(trades)
+    log.info(f"Zapisano nowy sygnał do backtestu: {r['symbol']} {r['overall_bias']}")
+
+
+def _check_single_trade_outcome(trade):
+    """Sprawdza czy cena od momentu wejścia dotknęła SL czy TP1 pierwsza.
+    Zwraca 'win', 'loss' albo None (nadal otwarty)."""
+    try:
+        candles = get_klines(trade["symbol"], trade["timeframe"], limit=500,
+                              start_time=trade["entry_time_ms"])
+    except Exception as e:
+        log.warning(f"Nie udało się sprawdzić trade'a {trade['symbol']}: {e}")
+        return None
+
+    for c in candles:
+        if c["open_time"] < trade["entry_time_ms"]:
+            continue
+        if trade["direction"] == "long":
+            hit_sl = c["low"] <= trade["stop_loss"]
+            hit_tp = c["high"] >= trade["tp1"]
+        else:
+            hit_sl = c["high"] >= trade["stop_loss"]
+            hit_tp = c["low"] <= trade["tp1"]
+        if hit_sl:
+            # Konserwatywnie: jeśli w tej samej świecy dotknięte oba poziomy,
+            # zakładamy że SL padł pierwszy (bezpieczniejsze założenie).
+            return "loss"
+        if hit_tp:
+            return "win"
+    return None
+
+
+def update_open_trades():
+    """Sprawdza wszystkie otwarte trade'y i aktualizuje ich status. Wywoływane co cykl."""
+    trades = _load_trades()
+    changed = False
+    for trade in trades:
+        if trade["status"] != "open":
+            continue
+        outcome = _check_single_trade_outcome(trade)
+        if outcome:
+            trade["status"] = outcome
+            trade["closed_at_ms"] = int(time.time() * 1000)
+            changed = True
+            log.info(f"Trade zamknięty: {trade['symbol']} {trade['direction']} → {outcome}")
+    if changed:
+        _save_trades(trades)
+
+
+def format_backtest_report():
+    trades = _load_trades()
+    if not trades:
+        return "📉 Brak zapisanych sygnałów jeszcze. Bot zbiera dane od momentu pierwszego wykrytego sygnału z pełną zgodnością timeframe'ów."
+
+    closed = [t for t in trades if t["status"] in ("win", "loss")]
+    open_trades = [t for t in trades if t["status"] == "open"]
+    wins = [t for t in closed if t["status"] == "win"]
+    losses = [t for t in closed if t["status"] == "loss"]
+
+    lines = ["📊 *Backtest — skuteczność sygnałów*", ""]
+    if closed:
+        win_rate = len(wins) / len(closed) * 100
+        lines.append(f"✅ Zamknięte: {len(closed)} ({len(wins)} trafione / {len(losses)} SL)")
+        lines.append(f"🎯 Win rate: *{win_rate:.1f}%*")
+    else:
+        lines.append("Brak jeszcze zamkniętych sygnałów (wszystkie nadal otwarte).")
+
+    lines.append(f"🔓 Nadal otwarte: {len(open_trades)}")
+
+    # Rozbicie per symbol
+    lines.append("")
+    lines.append("Rozbicie per para:")
+    for symbol in sorted(set(t["symbol"] for t in trades)):
+        sym_closed = [t for t in closed if t["symbol"] == symbol]
+        if sym_closed:
+            sym_wins = sum(1 for t in sym_closed if t["status"] == "win")
+            lines.append(f"  {symbol}: {sym_wins}/{len(sym_closed)} trafionych "
+                         f"({sym_wins/len(sym_closed)*100:.0f}%)")
+        else:
+            sym_open = sum(1 for t in trades if t["symbol"] == symbol and t["status"] == "open")
+            lines.append(f"  {symbol}: brak zamkniętych ({sym_open} otwartych)")
+
+    lines.append("")
+    lines.append("_To statystyka historyczna tego bota, nie gwarancja przyszłych wyników. "
+                 "Mała próbka = mało wiarygodne wnioski._")
+    return "\n".join(lines)
+
+
 # ---------------------- TELEGRAM ----------------------
 def _check_telegram_response(r, context):
     """Sprawdza odpowiedź Telegrama; zwraca True jeśli sukces, loguje szczegóły błędu jeśli nie."""
@@ -581,16 +709,34 @@ def send_photo(api_url, chat_id, photo_bytes, caption=""):
         log.error(f"Błąd wysyłki zdjęcia Telegram: {e}")
 
 
-def send_message(api_url, chat_id, text):
+def send_message(api_url, chat_id, text, reply_markup=None):
     try:
-        r = _session.post(f"{api_url}/sendMessage", data={
-            "chat_id": chat_id, "text": text, "parse_mode": "Markdown",
-        }, timeout=10)
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        r = _session.post(f"{api_url}/sendMessage", data=data, timeout=10)
         if not _check_telegram_response(r, "sendMessage"):
             # Fallback bez Markdown, gdyby formatowanie było niepoprawne
-            _session.post(f"{api_url}/sendMessage", data={"chat_id": chat_id, "text": text}, timeout=10)
+            data.pop("parse_mode", None)
+            _session.post(f"{api_url}/sendMessage", data=data, timeout=10)
     except Exception as e:
         log.error(f"Błąd wysyłki Telegram: {e}")
+
+
+def answer_callback_query(api_url, callback_query_id):
+    """Zatrzymuje 'kółko ładowania' na przycisku po kliknięciu."""
+    try:
+        _session.post(f"{api_url}/answerCallbackQuery",
+                       data={"callback_query_id": callback_query_id}, timeout=10)
+    except Exception as e:
+        log.error(f"Błąd answerCallbackQuery: {e}")
+
+
+def main_menu_keyboard():
+    return {"inline_keyboard": [[
+        {"text": "📊 Analiza", "callback_data": "analiza"},
+        {"text": "📈 Backtest", "callback_data": "backtest"},
+    ]]}
 
 
 def get_updates(api_url, offset=None):
@@ -602,6 +748,22 @@ def get_updates(api_url, offset=None):
 
 
 # ---------------------- GŁÓWNA PĘTLA ----------------------
+def run_analiza(api_url, chat_id):
+    for symbol in SYMBOLS:
+        r = analyze_symbol(symbol)
+        caption = format_report(r)
+        try:
+            chart = generate_chart(r)
+            send_photo(api_url, chat_id, chart, caption=caption)
+        except Exception as chart_err:
+            log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
+            send_message(api_url, chat_id, caption)
+
+
+def run_backtest(api_url, chat_id):
+    send_message(api_url, chat_id, format_backtest_report())
+
+
 def main():
     token, default_chat_id, api_url = get_config()
     log.info(f"Bot startuje... symbole: {SYMBOLS}, timeframes: {TIMEFRAMES}")
@@ -609,39 +771,55 @@ def main():
     last_auto_alert_bias = {s: None for s in SYMBOLS}
 
     send_message(api_url, default_chat_id,
-                 f"🤖 Bot wystartował. Śledzę: {', '.join(SYMBOLS)} na {', '.join(TIMEFRAMES)}. "
-                 f"Wpisz /analiza żeby dostać raport na żądanie.")
+                 "🤖 Cześć! Co potrzebujesz?", reply_markup=main_menu_keyboard())
 
     while True:
         try:
             updates = get_updates(api_url, offset=last_update_id)
             for u in updates:
                 last_update_id = u["update_id"] + 1
+
+                # --- Kliknięcie przycisku ---
+                cq = u.get("callback_query")
+                if cq:
+                    answer_callback_query(api_url, cq["id"])
+                    cq_chat_id = cq["message"]["chat"]["id"]
+                    if cq["data"] == "analiza":
+                        run_analiza(api_url, cq_chat_id)
+                    elif cq["data"] == "backtest":
+                        run_backtest(api_url, cq_chat_id)
+                    continue
+
+                # --- Zwykła wiadomość tekstowa ---
                 msg = u.get("message", {})
                 text = msg.get("text", "")
                 chat_id = msg.get("chat", {}).get("id")
-                if text and text.strip().lower() in ("/analiza", "/start", "/analysis"):
-                    for symbol in SYMBOLS:
-                        r = analyze_symbol(symbol)
-                        caption = format_report(r)
-                        try:
-                            chart = generate_chart(r)
-                            send_photo(api_url, chat_id, chart, caption=caption)
-                        except Exception as chart_err:
-                            log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
-                            send_message(api_url, chat_id, caption)
+                cmd = text.strip().lower() if text else ""
+
+                if cmd in ("/analiza", "/analysis"):
+                    run_analiza(api_url, chat_id)
+                elif cmd == "/backtest":
+                    run_backtest(api_url, chat_id)
+                elif chat_id:
+                    # Cokolwiek innego (w tym /start) -> pokaż menu z przyciskami
+                    send_message(api_url, chat_id, "Siema! Co potrzebujesz? 👇",
+                                 reply_markup=main_menu_keyboard())
+
+            # Sprawdź czy otwarte trade'y z backtestu dotknęły SL/TP
+            update_open_trades()
 
             for symbol in SYMBOLS:
                 r = analyze_symbol(symbol)
                 if r["overall_bias"] in ("long", "short"):
                     if r["overall_bias"] != last_auto_alert_bias[symbol]:
-                        caption = "🔥 *Zgodność timeframe'ów wykryta!*\n\n" + format_report(r)
+                        caption = "🔥 " + format_report(r)
                         try:
                             chart = generate_chart(r)
                             send_photo(api_url, default_chat_id, chart, caption=caption)
                         except Exception as chart_err:
                             log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
                             send_message(api_url, default_chat_id, caption)
+                        record_signal(r)  # zapisz do backtestu przy KAŻDYM nowym sygnale
                         last_auto_alert_bias[symbol] = r["overall_bias"]
                 else:
                     last_auto_alert_bias[symbol] = None
