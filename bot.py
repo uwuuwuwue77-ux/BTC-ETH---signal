@@ -784,8 +784,12 @@ def main():
     send_message(api_url, default_chat_id,
                  "🤖 Cześć! Co potrzebujesz?", reply_markup=main_menu_keyboard())
 
+    last_market_check = 0  # wymusza sprawdzenie rynku od razu przy pierwszej iteracji
+
     while True:
         try:
+            # get_updates używa long-pollingu (czeka do 20s na nową wiadomość) -
+            # to naturalnie tempuje pętlę bez potrzeby dodatkowego sleep()
             updates = get_updates(api_url, offset=last_update_id)
             for u in updates:
                 last_update_id = u["update_id"] + 1
@@ -816,29 +820,33 @@ def main():
                     send_message(api_url, chat_id, "Siema! Co potrzebujesz? 👇",
                                  reply_markup=main_menu_keyboard())
 
-            # Sprawdź czy otwarte trade'y z backtestu dotknęły SL/TP
-            update_open_trades()
+            # Sprawdzanie rynku (wolniejsze, wiele requestów) - TYLKO co CHECK_EVERY_SECONDS,
+            # nie blokuje sprawdzania nowych wiadomości w międzyczasie
+            now = time.time()
+            if now - last_market_check >= CHECK_EVERY_SECONDS:
+                update_open_trades()
 
-            for symbol in SYMBOLS:
-                r = analyze_symbol(symbol)
-                if r["overall_bias"] in ("long", "short"):
-                    if r["overall_bias"] != last_auto_alert_bias[symbol]:
-                        caption = "🔥 " + format_report(r)
-                        try:
-                            chart = generate_chart(r)
-                            send_photo(api_url, default_chat_id, chart, caption=caption)
-                        except Exception as chart_err:
-                            log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
-                            send_message(api_url, default_chat_id, caption)
-                        record_signal(r)  # zapisz do backtestu przy KAŻDYM nowym sygnale
-                        last_auto_alert_bias[symbol] = r["overall_bias"]
-                else:
-                    last_auto_alert_bias[symbol] = None
+                for symbol in SYMBOLS:
+                    r = analyze_symbol(symbol)
+                    if r["overall_bias"] in ("long", "short"):
+                        if r["overall_bias"] != last_auto_alert_bias[symbol]:
+                            caption = "🔥 " + format_report(r)
+                            try:
+                                chart = generate_chart(r)
+                                send_photo(api_url, default_chat_id, chart, caption=caption)
+                            except Exception as chart_err:
+                                log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
+                                send_message(api_url, default_chat_id, caption)
+                            record_signal(r)  # zapisz do backtestu przy KAŻDYM nowym sygnale
+                            last_auto_alert_bias[symbol] = r["overall_bias"]
+                    else:
+                        last_auto_alert_bias[symbol] = None
+
+                last_market_check = now
 
         except Exception as e:
             log.error(f"Błąd w pętli głównej: {e}")
-
-        time.sleep(CHECK_EVERY_SECONDS)
+            time.sleep(2)  # krótka pauza po błędzie, żeby nie zapętlić się błyskawicznie
 
 
 if __name__ == "__main__":
