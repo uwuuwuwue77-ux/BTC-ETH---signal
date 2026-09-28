@@ -20,6 +20,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("eth_bot")
@@ -43,8 +44,33 @@ TIMEFRAMES = [s.strip() for s in os.environ.get("TIMEFRAMES", "15m,1h,4h").split
 CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "900"))
 # Auto-alert wysyłany gdy liczba zgodnych timeframe'ów >= próg (np. 2 z 3)
 CONFLUENCE_THRESHOLD = int(os.environ.get("CONFLUENCE_THRESHOLD", "2"))
-# Krótka pauza między requestami - dodatkowa ochrona przed rate-limitem
-REQUEST_PAUSE_SECONDS = float(os.environ.get("REQUEST_PAUSE_SECONDS", "0.3"))
+# Minimalny odstęp między alertami dla TEGO SAMEGO symbolu - chroni przed spamem
+# gdy bias migocze (long/neutralny/long) w krótkim czasie. Domyślnie 1h.
+ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "3600"))
+
+# ---------- Wielkość pozycji i dźwignia ----------
+# Domyślnie: BTC i złoto (XAUTUSDT) = 5x, wszystko inne (np. ETH) = 2x.
+# Wielkość pozycji (notional w USDT) jest wspólna dla wszystkich symboli -
+# różni się tylko dźwignia, więc margin (wymagany depozyt) jest inny.
+# Format LEVERAGE_OVERRIDES: "SYMBOL:leverage,SYMBOL2:leverage2"
+def _parse_leverage_overrides(raw):
+    result = {}
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        sym, lev = pair.split(":", 1)
+        try:
+            result[sym.strip()] = float(lev.strip())
+        except ValueError:
+            log.warning(f"Nie udało się sparsować LEVERAGE_OVERRIDES dla: {pair}")
+    return result
+
+
+LEVERAGE_OVERRIDES = _parse_leverage_overrides(
+    os.environ.get("LEVERAGE_OVERRIDES", "BTC:5,XAUTUSDT:5")
+)
+DEFAULT_LEVERAGE = float(os.environ.get("DEFAULT_LEVERAGE", "2"))
+POSITION_SIZE_USDT = float(os.environ.get("POSITION_SIZE_USDT", "10000"))
 
 # ---------- Hyperliquid: crypto (ETH, BTC) ----------
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
@@ -178,6 +204,55 @@ def get_futures_flow(symbol, dex=""):
     except Exception as e:
         log.warning(f"Brak danych futures dla {symbol}: {e}")
         return None
+
+
+# ---------------------- ORDER BOOK / ŚCIANY ZLECEŃ ----------------------
+# Realniejszy proxy pozycjonowania dużych graczy niż funding rate - pokazuje
+# konkretne, duże zlecenia czekające blisko ceny (potencjalne poziomy obrony/ataku).
+def get_hyperliquid_orderbook(symbol, dex=""):
+    body = {"type": "l2Book", "coin": symbol}
+    if dex:
+        body["dex"] = dex
+    r = _session.post(HYPERLIQUID_INFO_URL, json=body, timeout=10)
+    r.raise_for_status()
+    levels = r.json()["levels"]
+    return {
+        "bids": [{"price": float(l["px"]), "size": float(l["sz"])} for l in levels[0]],
+        "asks": [{"price": float(l["px"]), "size": float(l["sz"])} for l in levels[1]],
+    }
+
+
+def get_binance_orderbook(symbol, dex=None):
+    r = _session.get("https://fapi.binance.com/fapi/v1/depth",
+                      params={"symbol": symbol, "limit": 100}, timeout=10)
+    r.raise_for_status()
+    d = r.json()
+    return {
+        "bids": [{"price": float(p), "size": float(q)} for p, q in d["bids"]],
+        "asks": [{"price": float(p), "size": float(q)} for p, q in d["asks"]],
+    }
+
+
+def detect_liquidity_walls(orderbook, current_price, pct_range=0.02, wall_ratio=2.5):
+    """Znajduje największą 'ścianę' po stronie bid i ask w promieniu pct_range od
+    ceny - poziom ze zleceniem znacząco (wall_ratio x) większym niż mediana
+    okolicznych zleceń. To realne zlecenia czekające na rynku, nie proxy."""
+    def find_wall(levels, side):
+        nearby = [l for l in levels if abs(l["price"] - current_price) / current_price <= pct_range]
+        if len(nearby) < 3:
+            return None
+        sizes = sorted(l["size"] for l in nearby)
+        median_size = sizes[len(sizes) // 2]
+        biggest = max(nearby, key=lambda l: l["size"])
+        if median_size > 0 and biggest["size"] > median_size * wall_ratio:
+            return {"side": side, "price": biggest["price"], "size": biggest["size"],
+                    "vs_median": biggest["size"] / median_size}
+        return None
+
+    return {
+        "bid_wall": find_wall(orderbook["bids"], "bid"),
+        "ask_wall": find_wall(orderbook["asks"], "ask"),
+    }
 
 
 # ---------------------- ZŁOTO: BINANCE FUTURES (XAUT/USDT) ----------------------
@@ -357,8 +432,15 @@ BEARISH_PATTERNS = ("Bearish Engulfing", "Evening Star", "Shooting Star", "Hangi
 # ---------------------- SMART MONEY CONCEPTS ----------------------
 def detect_fvg(candles, lookback=20):
     """Fair Value Gap: luka między świecą 1 a świecą 3 (świeca 2 jej nie wypełnia).
-    Zwraca listę niedawnych, jeszcze niewypełnionych FVG."""
+    Zwraca (gaps, ifvgs):
+    - gaps: niedawne, jeszcze niewypełnione FVG (cena nie wróciła w ich zakres)
+    - ifvgs: Inverse FVG - luki, przez które cena później zamknęła się NA WYLOT
+      (nie tylko dotknęła, ale przebiła całą strefę) - taka strefa odwraca polaryzację:
+      niedoszły bullish FVG staje się potencjalnym oporem (bearish IFVG) i odwrotnie.
+      To rozpoznanie 'nieudanej' luki, którą smart money często wykorzystuje jako
+      nową strefę podaży/popytu w przeciwnym kierunku."""
     gaps = []
+    ifvgs = []
     start = max(2, len(candles) - lookback)
     for i in range(start, len(candles)):
         c1, c3 = candles[i - 2], candles[i]
@@ -368,14 +450,33 @@ def detect_fvg(candles, lookback=20):
             gap = {"type": "bearish", "top": c1["low"], "bottom": c3["high"], "index": i}
         else:
             continue
+
         filled = False
+        inverted = False
         for later in candles[i + 1:]:
-            if gap["bottom"] <= later["close"] <= gap["top"]:
-                filled = True
-                break
-        if not filled:
+            if gap["type"] == "bullish":
+                if later["close"] < gap["bottom"]:
+                    inverted = True
+                    break
+                if gap["bottom"] <= later["close"] <= gap["top"]:
+                    filled = True
+            else:
+                if later["close"] > gap["top"]:
+                    inverted = True
+                    break
+                if gap["bottom"] <= later["close"] <= gap["top"]:
+                    filled = True
+
+        if inverted:
+            ifvgs.append({
+                "type": "bearish" if gap["type"] == "bullish" else "bullish",  # odwrócona polaryzacja
+                "original_type": gap["type"],
+                "top": gap["top"], "bottom": gap["bottom"], "index": gap["index"],
+            })
+        elif not filled:
             gaps.append(gap)
-    return gaps[-3:]
+
+    return gaps[-3:], ifvgs[-3:]
 
 
 def detect_liquidity_sweep(candles, swing_lookback=15):
@@ -394,6 +495,42 @@ def detect_liquidity_sweep(candles, swing_lookback=15):
     if last["low"] < prior_low and last["close"] > prior_low:
         return {"type": "sweep_low", "level": prior_low}
     return None
+
+
+def detect_order_blocks(candles, lookback=30, momentum_mult=1.5):
+    """Order Block: ostatnia świeca PRZECIWNA do kierunku, tuż przed silnym
+    impulsem (displacement) w drugą stronę. Bullish OB = ostatnia spadkowa
+    świeca przed mocnym ruchem w górę (świeca łamie jej szczyt z ponadprzeciętnym
+    korpusem); Bearish OB = analogicznie w dół. To strefa, z której - wg teorii
+    smart money - instytucje otwierały pozycje przed impulsem, i do której cena
+    często wraca zanim kontynuuje ruch. Zwraca tylko niedawne, jeszcze
+    'niedotknięte' (unmitigated) strefy."""
+    body_sizes = [abs(c["close"] - c["open"]) for c in candles]
+    avg_body = sum(body_sizes) / len(body_sizes) if body_sizes else 0
+    if avg_body == 0:
+        return []
+
+    start = max(1, len(candles) - lookback)
+    raw_obs = []
+    for i in range(start, len(candles) - 1):
+        c, nxt = candles[i], candles[i + 1]
+        nxt_body = abs(nxt["close"] - nxt["open"])
+        if c["close"] < c["open"] and nxt["close"] > nxt["open"]:
+            if nxt["close"] > c["high"] and nxt_body > avg_body * momentum_mult:
+                raw_obs.append({"type": "bullish", "top": c["high"], "bottom": c["low"], "index": i})
+        if c["close"] > c["open"] and nxt["close"] < nxt["open"]:
+            if nxt["close"] < c["low"] and nxt_body > avg_body * momentum_mult:
+                raw_obs.append({"type": "bearish", "top": c["high"], "bottom": c["low"], "index": i})
+
+    # Odfiltruj strefy, do których cena już wróciła (zamknęła się w ich zakresie) -
+    # zostają tylko "świeże", jeszcze nietestowane order blocki.
+    unmitigated = []
+    for ob in raw_obs:
+        mitigated = any(ob["bottom"] <= later["close"] <= ob["top"]
+                         for later in candles[ob["index"] + 2:])
+        if not mitigated:
+            unmitigated.append(ob)
+    return unmitigated[-2:]  # max 2, żeby nie zaśmiecać raportu/wykresu
 
 
 def find_swing_points(candles, window=3):
@@ -462,8 +599,9 @@ def analyze_timeframe(candles):
     rising_streak = all(d > 0 for d in recent_diffs)
 
     structure = market_structure(candles)
-    fvgs = detect_fvg(candles)
+    fvgs, ifvgs = detect_fvg(candles)
     sweep = detect_liquidity_sweep(candles)
+    order_blocks = detect_order_blocks(candles)
 
     bullish_votes, bearish_votes = [], []
 
@@ -505,6 +643,25 @@ def analyze_timeframe(candles):
         else:
             bearish_votes.append(f"niewypełniony bearish FVG {gap['bottom']:.2f}-{gap['top']:.2f}")
 
+    # IFVG waży NIECO mocniej niż zwykły FVG - to sygnał że wcześniejsza teza
+    # rynku (ta pierwotna luka) została jawnie unieważniona, co jest silniejszą
+    # informacją niż sama obecność niewypełnionej luki.
+    for ifvg in ifvgs:
+        if ifvg["type"] == "bullish":
+            bullish_votes.append(f"IFVG byczy (odwrócony {ifvg['original_type']}) "
+                                  f"{ifvg['bottom']:.2f}-{ifvg['top']:.2f}")
+            bullish_votes.append("IFVG - unieważniona pierwotna teza")
+        else:
+            bearish_votes.append(f"IFVG niedźwiedzi (odwrócony {ifvg['original_type']}) "
+                                  f"{ifvg['bottom']:.2f}-{ifvg['top']:.2f}")
+            bearish_votes.append("IFVG - unieważniona pierwotna teza")
+
+    for ob in order_blocks:
+        if ob["type"] == "bullish":
+            bullish_votes.append(f"Order Block byczy {ob['bottom']:.2f}-{ob['top']:.2f}")
+        else:
+            bearish_votes.append(f"Order Block niedźwiedzi {ob['bottom']:.2f}-{ob['top']:.2f}")
+
     if len(bullish_votes) > len(bearish_votes):
         bias = "long"
     elif len(bearish_votes) > len(bullish_votes):
@@ -515,39 +672,62 @@ def analyze_timeframe(candles):
     return {
         "price": current_price, "atr": current_atr, "rsi": current_rsi,
         "trend": trend, "volume_ratio": volume_ratio, "pattern": pattern,
-        "structure": structure, "fvgs": fvgs, "sweep": sweep,
+        "structure": structure, "fvgs": fvgs, "ifvgs": ifvgs, "sweep": sweep,
+        "order_blocks": order_blocks,
         "bullish_votes": bullish_votes, "bearish_votes": bearish_votes,
         "bias": bias, "candles": candles,
     }
 
 
 # ---------------------- ANALIZA WIELO-INTERWAŁOWA ----------------------
-def analyze_symbol(symbol, dex="", kline_fn=get_klines, stats_fn=get_24h_stats, flow_fn=get_futures_flow):
+def analyze_symbol(symbol, dex="", kline_fn=get_klines, stats_fn=get_24h_stats,
+                    flow_fn=get_futures_flow, orderbook_fn=None):
     """Silnik analizy współdzielony między crypto (Hyperliquid) i złotem (Binance) -
-    kline_fn/stats_fn/flow_fn pozwalają wstrzyknąć inne źródło danych bez duplikowania
-    całej logiki struktury/FVG/sweep/confluence poniżej."""
+    kline_fn/stats_fn/flow_fn/orderbook_fn pozwalają wstrzyknąć inne źródło danych bez
+    duplikowania całej logiki struktury/FVG/sweep/confluence poniżej.
+    ZOPTYMALIZOWANE: wszystkie niezależne requesty (timeframe'y, 24h, funding, order
+    book) lecą RÓWNOLEGLE zamiast po kolei - znacząco szybsza analiza."""
     data_source = "binance" if kline_fn is get_binance_klines else "hyperliquid"
+    if orderbook_fn is None:
+        orderbook_fn = get_binance_orderbook if data_source == "binance" else get_hyperliquid_orderbook
+
     per_tf = {}
-    for tf in TIMEFRAMES:
+    with ThreadPoolExecutor(max_workers=len(TIMEFRAMES) + 3) as executor:
+        tf_futures = {executor.submit(kline_fn, symbol, tf, dex=dex): tf for tf in TIMEFRAMES}
+        stats_future = executor.submit(stats_fn, symbol, dex=dex)
+        flow_future = executor.submit(flow_fn, symbol, dex=dex)
+        orderbook_future = executor.submit(orderbook_fn, symbol, dex=dex)
+
+        for future in as_completed(tf_futures):
+            tf = tf_futures[future]
+            try:
+                per_tf[tf] = analyze_timeframe(future.result())
+            except Exception as e:
+                log.warning(f"Pominięto timeframe {tf} dla {symbol} (błąd: {e})")
+
         try:
-            candles = kline_fn(symbol, tf, dex=dex)
-            per_tf[tf] = analyze_timeframe(candles)
+            stats_24h = stats_future.result()
         except Exception as e:
-            log.warning(f"Pominięto timeframe {tf} dla {symbol} (błąd: {e})")
-        time.sleep(REQUEST_PAUSE_SECONDS)
+            log.warning(f"Brak danych 24h dla {symbol}: {e}")
+            stats_24h = None
+
+        try:
+            flow = flow_future.result()
+        except Exception as e:
+            log.warning(f"Brak danych futures dla {symbol}: {e}")
+            flow = None
+
+        try:
+            orderbook = orderbook_future.result()
+        except Exception as e:
+            log.warning(f"Brak order booka dla {symbol}: {e}")
+            orderbook = None
 
     if not per_tf:
         raise RuntimeError(f"Nie udało się pobrać żadnego timeframe'u dla {symbol}")
 
-    active_timeframes = list(per_tf.keys())
-
-    stats_24h = None
-    try:
-        stats_24h = stats_fn(symbol, dex=dex)
-    except Exception as e:
-        log.warning(f"Brak danych 24h dla {symbol}: {e}")
-
-    flow = flow_fn(symbol, dex=dex)
+    # Zachowaj kolejność z TIMEFRAMES (as_completed kończy w losowej kolejności)
+    active_timeframes = [tf for tf in TIMEFRAMES if tf in per_tf]
 
     biases = [per_tf[tf]["bias"] for tf in active_timeframes]
     long_count = biases.count("long")
@@ -561,25 +741,81 @@ def analyze_symbol(symbol, dex="", kline_fn=get_klines, stats_fn=get_24h_stats, 
 
     base_tf_name = active_timeframes[0]
     base_tf = per_tf[base_tf_name]
+
+    liquidity_walls = None
+    if orderbook:
+        try:
+            liquidity_walls = detect_liquidity_walls(orderbook, base_tf["price"])
+        except Exception as e:
+            log.warning(f"Błąd wykrywania ścian zleceń dla {symbol}: {e}")
+
+    # RR 1:2 na TP1 (odległość do TP1 = 2x odległość do SL), TP2 = 1:3 jako
+    # dalszy, "rozciągnięty" cel dla tych co chcą trzymać dłużej.
+    RISK_ATR_MULT = 1.5
     entry_zone = stop_loss = tp1 = tp2 = None
     if overall_bias == "long":
         p, a_ = base_tf["price"], base_tf["atr"]
+        risk_dist = a_ * RISK_ATR_MULT
         entry_zone = (p - a_ * 0.3, p)
-        stop_loss = p - a_ * 1.5
-        tp1, tp2 = p + a_ * 1.5, p + a_ * 3
+        stop_loss = p - risk_dist
+        tp1, tp2 = p + risk_dist * 2, p + risk_dist * 3
     elif overall_bias == "short":
         p, a_ = base_tf["price"], base_tf["atr"]
+        risk_dist = a_ * RISK_ATR_MULT
         entry_zone = (p, p + a_ * 0.3)
-        stop_loss = p + a_ * 1.5
-        tp1, tp2 = p - a_ * 1.5, p - a_ * 3
+        stop_loss = p + risk_dist
+        tp1, tp2 = p - risk_dist * 2, p - risk_dist * 3
+
+    position_plan = calculate_position_plan(symbol, base_tf["price"], stop_loss, tp1, overall_bias)
 
     return {
         "symbol": symbol, "dex": dex, "data_source": data_source,
         "per_tf": per_tf, "active_timeframes": active_timeframes,
-        "stats_24h": stats_24h, "flow": flow,
+        "stats_24h": stats_24h, "flow": flow, "liquidity_walls": liquidity_walls,
         "overall_bias": overall_bias, "long_count": long_count, "short_count": short_count,
         "entry_zone": entry_zone, "stop_loss": stop_loss, "tp1": tp1, "tp2": tp2,
+        "position_plan": position_plan,
         "base_tf": base_tf_name,
+    }
+
+
+def calculate_position_plan(symbol, price, stop_loss, tp1, direction):
+    """Liczy wielkość pozycji, wymagany margin i realne ryzyko/nagrodę w USDT
+    na bazie skonfigurowanej dźwigni i wielkości pozycji PER SYMBOL (ustawianej
+    przez /size albo przycisk w menu, z sensownymi domyślnymi wartościami).
+    To orientacyjny plan, nie rekomendacja - zawsze zweryfikuj sam przed wejściem,
+    szczególnie przy wysokiej dźwigni (ryzyko likwidacji)."""
+    if direction not in ("long", "short") or stop_loss is None:
+        return None
+
+    leverage = LEVERAGE_OVERRIDES.get(symbol, DEFAULT_LEVERAGE)
+    notional = get_position_size(symbol)
+    margin = notional / leverage
+    quantity = notional / price
+
+    if direction == "long":
+        risk_per_unit = price - stop_loss
+        reward_per_unit = tp1 - price
+    else:
+        risk_per_unit = stop_loss - price
+        reward_per_unit = price - tp1
+
+    risk_usdt = risk_per_unit * quantity
+    reward_usdt = reward_per_unit * quantity
+    rr_ratio = reward_usdt / risk_usdt if risk_usdt else None
+
+    # Przybliżony poziom likwidacji (uproszczony, bez uwzględnienia fundingu/fees):
+    # dla longa likwidacja gdy strata = margin, czyli price spada o (1/leverage)*100%
+    liq_distance_pct = 100 / leverage
+    if direction == "long":
+        approx_liquidation = price * (1 - liq_distance_pct / 100)
+    else:
+        approx_liquidation = price * (1 + liq_distance_pct / 100)
+
+    return {
+        "leverage": leverage, "notional_usdt": notional, "margin_usdt": margin,
+        "quantity": quantity, "risk_usdt": risk_usdt, "reward_usdt": reward_usdt,
+        "rr_ratio": rr_ratio, "approx_liquidation": approx_liquidation,
     }
 
 
@@ -699,6 +935,16 @@ def format_gold_report(r):
             lines.append(f"   🟢 Long aktywuje się powyżej `{r['stats_24h']['high']:.2f}`")
             lines.append(f"   🔴 Short aktywuje się poniżej `{r['stats_24h']['low']:.2f}`")
 
+    if r.get("position_plan"):
+        pp = r["position_plan"]
+        lines.append("")
+        lines.append(f"💼 ${pp['notional_usdt']:,.0f} @{pp['leverage']:.0f}x "
+                      f"(margin ${pp['margin_usdt']:,.0f}) · "
+                      f"ryzyko ${pp['risk_usdt']:,.0f} / nagroda ${pp['reward_usdt']:,.0f} "
+                      f"(RR 1:{pp['rr_ratio']:.1f})")
+        lines.append(f"⚠️ Orientacyjna likwidacja ~`{pp['approx_liquidation']:.2f}` "
+                      f"(uproszczone, bez fundingu/opłat)")
+
     lines.append("")
     lines.append("_Analiza techniczna + zagregowane dane rynku futures. Nie stanowi porady "
                  "inwestycyjnej. Kalendarz makro wymaga ręcznej weryfikacji._")
@@ -736,8 +982,26 @@ def format_report(r):
             highlights.append(f"⚡ {sweep_txt} {tf} @{d['sweep']['level']:.0f}")
         if d["pattern"] and (d["pattern"] in BULLISH_PATTERNS or d["pattern"] in BEARISH_PATTERNS):
             highlights.append(f"🕯️ {d['pattern']} ({tf})")
+        for ifvg in d.get("ifvgs", []):
+            arrow = "🔄🟢" if ifvg["type"] == "bullish" else "🔄🔴"
+            highlights.append(f"{arrow} IFVG {tf} @{ifvg['bottom']:.0f}-{ifvg['top']:.0f}")
+        for ob in d.get("order_blocks", []):
+            icon = "🟩" if ob["type"] == "bullish" else "🟥"
+            highlights.append(f"{icon} OB {tf} @{ob['bottom']:.0f}-{ob['top']:.0f}")
     if highlights:
         lines.append(" · ".join(highlights[:3]))  # max 3, żeby nie zaśmiecać
+
+    if r.get("liquidity_walls"):
+        w = r["liquidity_walls"]
+        wall_txts = []
+        if w.get("bid_wall"):
+            bw = w["bid_wall"]
+            wall_txts.append(f"🧱 duża ściana kupna @{bw['price']:.0f} ({bw['vs_median']:.1f}x medianę)")
+        if w.get("ask_wall"):
+            aw = w["ask_wall"]
+            wall_txts.append(f"🧱 duża ściana sprzedaży @{aw['price']:.0f} ({aw['vs_median']:.1f}x medianę)")
+        if wall_txts:
+            lines.append(" · ".join(wall_txts))
 
     if r["flow"] and (r["flow"]["funding_rate_pct"] > 0.03 or r["flow"]["funding_rate_pct"] < -0.03):
         f = r["flow"]
@@ -747,6 +1011,15 @@ def format_report(r):
     if r["entry_zone"]:
         lines.append(f"🎯 Entry `{r['entry_zone'][0]:.0f}-{r['entry_zone'][1]:.0f}` "
                       f"SL `{r['stop_loss']:.0f}` TP `{r['tp1']:.0f}/{r['tp2']:.0f}`")
+
+    if r.get("position_plan"):
+        pp = r["position_plan"]
+        lines.append(f"💼 ${pp['notional_usdt']:,.0f} @{pp['leverage']:.0f}x "
+                      f"(margin ${pp['margin_usdt']:,.0f}) · "
+                      f"ryzyko ${pp['risk_usdt']:,.0f} / nagroda ${pp['reward_usdt']:,.0f} "
+                      f"(RR 1:{pp['rr_ratio']:.1f})")
+        lines.append(f"⚠️ Orientacyjna likwidacja ~`{pp['approx_liquidation']:.0f}` "
+                      f"(uproszczone, bez fundingu/opłat)")
 
     return "\n".join(lines)
 
@@ -766,12 +1039,12 @@ def generate_chart(r, n_candles=50):
     offset = len(d["candles"]) - len(candles)
 
     fig, (ax_price, ax_vol) = plt.subplots(
-        2, 1, figsize=(11, 6.5), sharex=True,
+        2, 1, figsize=(12, 7.5), sharex=True,
         gridspec_kw={"height_ratios": [3, 1]}, facecolor="#0d1117"
     )
     for ax in (ax_price, ax_vol):
         ax.set_facecolor("#0d1117")
-        ax.tick_params(colors="#c9d1d9")
+        ax.tick_params(colors="#c9d1d9", labelsize=8)
         for spine in ax.spines.values():
             spine.set_color("#30363d")
 
@@ -786,25 +1059,85 @@ def generate_chart(r, n_candles=50):
                                       facecolor=color, edgecolor=color))
         ax_vol.bar(i, c["volume"], color=color, width=width)
 
+    # Zakres cenowy liczony wprost z danych (do rozstawiania etykiet bez nachodzenia -
+    # ax.get_ylim() nie jest jeszcze wiarygodne przed pełnym narysowaniem wszystkiego)
+    price_min = min(c["low"] for c in candles)
+    price_max = max(c["high"] for c in candles)
+    price_span = (price_max - price_min) or (price_max * 0.01) or 1
+    min_label_gap = price_span * 0.035
+    placed_labels = []  # (x, y) już zajętych miejsc na etykiety
+
+    def place_label(x, y, text, color, va, weight="normal"):
+        """Rysuje etykietę tylko jeśli nie nachodzi na już istniejącą - strefa
+        (box/hatch) i tak zostaje narysowana zawsze, chodzi tylko o czytelność tekstu."""
+        too_close = any(abs(x - px) < 6 and abs(y - py) < min_label_gap for px, py in placed_labels)
+        if too_close:
+            return
+        ax_price.text(x, y, text, color=color, fontsize=7, va=va, alpha=0.95, fontweight=weight)
+        placed_labels.append((x, y))
+
     for gap in d["fvgs"]:
-        idx = gap["index"] - offset
-        if idx < 0:
-            idx = 0
+        idx = max(0, gap["index"] - offset)
         box_color = "#26a69a" if gap["type"] == "bullish" else "#ef5350"
-        box_left = max(0, idx - 1)  # zaczyna się na środkowej świecy trzyświecowej formacji
-        box_width = (len(candles) - 1) - box_left  # ciągnie się do prawej krawędzi (luka niewypełniona)
+        box_left = max(0, idx - 1)
+        box_width = (len(candles) - 1) - box_left
         ax_price.add_patch(Rectangle(
             (box_left, gap["bottom"]), box_width, gap["top"] - gap["bottom"],
-            facecolor=box_color, edgecolor=box_color, alpha=0.18, linewidth=0.8, linestyle="--"
+            facecolor=box_color, edgecolor=box_color, alpha=0.16, linewidth=0.8, linestyle="--"
         ))
-        ax_price.text(box_left + 0.3, gap["top"], "FVG", color=box_color,
-                       fontsize=7, va="bottom", alpha=0.9)
+        place_label(box_left + 0.3, gap["top"], "FVG", box_color, "bottom")
+
+    # IFVG - kreskowanie (hatch), żeby odróżnić od zwykłego FVG na pierwszy rzut oka
+    for ifvg in d.get("ifvgs", []):
+        idx = max(0, ifvg["index"] - offset)
+        box_color = "#26a69a" if ifvg["type"] == "bullish" else "#ef5350"
+        box_left = max(0, idx - 1)
+        box_width = (len(candles) - 1) - box_left
+        ax_price.add_patch(Rectangle(
+            (box_left, ifvg["bottom"]), box_width, ifvg["top"] - ifvg["bottom"],
+            facecolor=box_color, edgecolor=box_color, alpha=0.20, linewidth=1,
+            linestyle="-", hatch="///"
+        ))
+        place_label(box_left + 0.3, ifvg["bottom"], "IFVG", box_color, "top", weight="bold")
+
+    # Order Blocks - solidna ramka bez kreskowania, kropkowane wypełnienie -
+    # wizualnie odróżnione od FVG (przerywana ramka) i IFVG (hatch)
+    for ob in d.get("order_blocks", []):
+        idx = max(0, ob["index"] - offset)
+        box_color = "#26a69a" if ob["type"] == "bullish" else "#ef5350"
+        box_left = max(0, idx)
+        box_width = (len(candles) - 1) - box_left
+        ax_price.add_patch(Rectangle(
+            (box_left, ob["bottom"]), box_width, ob["top"] - ob["bottom"],
+            facecolor=box_color, edgecolor=box_color, alpha=0.12, linewidth=1.3, linestyle="-"
+        ))
+        place_label(box_left + 0.3, (ob["top"] + ob["bottom"]) / 2, "OB", box_color, "center", weight="bold")
+
+    # VWAP - liczony jako narastająca średnia ważona wolumenem W OBRĘBIE pokazanego
+    # okna świec (nie od początku dnia - to bot wielo-interwałowy 24/7, nie sesja giełdowa)
+    cum_pv, cum_vol, vwap_line = 0.0, 0.0, []
+    for c in candles:
+        typical = (c["high"] + c["low"] + c["close"]) / 3
+        cum_pv += typical * c["volume"]
+        cum_vol += c["volume"]
+        vwap_line.append(cum_pv / cum_vol if cum_vol else typical)
+    ax_price.plot(range(len(candles)), vwap_line, color="#f0b90b", linewidth=1.3,
+                  alpha=0.85, label="VWAP (okno)")
 
     if r["stats_24h"]:
-        ax_price.axhline(r["stats_24h"]["high"], color="#f0b90b", linestyle="-",
-                          linewidth=1, alpha=0.6, label="24h High")
-        ax_price.axhline(r["stats_24h"]["low"], color="#f0b90b", linestyle="-",
-                          linewidth=1, alpha=0.6, label="24h Low")
+        ax_price.axhline(r["stats_24h"]["high"], color="#8a8a8a", linestyle="-",
+                          linewidth=1, alpha=0.5, label="24h High")
+        ax_price.axhline(r["stats_24h"]["low"], color="#8a8a8a", linestyle="-",
+                          linewidth=1, alpha=0.5, label="24h Low")
+
+    if r.get("liquidity_walls"):
+        w = r["liquidity_walls"]
+        if w.get("bid_wall"):
+            ax_price.axhline(w["bid_wall"]["price"], color="#00e5ff", linestyle="-.",
+                              linewidth=1.2, alpha=0.7, label="Ściana kupna")
+        if w.get("ask_wall"):
+            ax_price.axhline(w["ask_wall"]["price"], color="#ff00e5", linestyle="-.",
+                              linewidth=1.2, alpha=0.7, label="Ściana sprzedaży")
 
     if r["entry_zone"]:
         ax_price.axhline(r["stop_loss"], color="#ef5350", linestyle="--", linewidth=1, label="SL")
@@ -814,6 +1147,19 @@ def generate_chart(r, n_candles=50):
 
     ax_price.legend(loc="upper left", facecolor="#0d1117", labelcolor="#c9d1d9",
                      framealpha=0.7, fontsize=8)
+
+    # Oś Y skupiona na świecach + poziomach transakcji (entry/SL/TP/ściany) -
+    # odległe linie 24h High/Low nie rozciągają wykresu i nie ściskają świec.
+    focus_lo, focus_hi = price_min, price_max
+    for lvl in (r.get("stop_loss"), r.get("tp1"), r.get("tp2")):
+        if lvl:
+            focus_lo, focus_hi = min(focus_lo, lvl), max(focus_hi, lvl)
+    if r.get("liquidity_walls"):
+        for w in r["liquidity_walls"].values():
+            if w:
+                focus_lo, focus_hi = min(focus_lo, w["price"]), max(focus_hi, w["price"])
+    pad = (focus_hi - focus_lo) * 0.06
+    ax_price.set_ylim(focus_lo - pad, focus_hi + pad)
     ax_price.set_title(f"{symbol} ({base_tf}) — {r['overall_bias'].upper()} "
                         f"[{r['long_count']}L/{r['short_count']}S]",
                         color="#c9d1d9", fontsize=12)
@@ -821,26 +1167,30 @@ def generate_chart(r, n_candles=50):
     plt.tight_layout()
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), dpi=140)
     plt.close(fig)
     buf.seek(0)
     return buf
 
 
 # ---------------------- BACKTEST / TRACKING SKUTECZNOŚCI ----------------------
-# Bot zapisuje każdy wygenerowany sygnał (long/short) i w tle sprawdza, czy cena
-# po drodze dotknęła SL czy TP. Komenda /backtest pokazuje statystyki.
+# Bot trzyma historię sygnałów (backtest) i skonfigurowane rozmiary pozycji w JEDNYM
+# pliku stanu - Telegram pamięta tylko JEDNĄ przypiętą wiadomość na czat, więc żeby
+# backup obu rzeczy działał niezawodnie, muszą być razem, nie w osobnych plikach.
 #
 # PERSYSTENCJA: dysk na Railway/Render jest ulotny - restart/redeploy czyści plik.
-# Żeby historia PRZETRWAŁA restart, bot robi automatyczny backup pliku trades.json
-# na Telegram (wysyła go do Ciebie jako dokument i przypina wiadomość) za każdym
-# razem gdy coś się zmieni. Przy starcie bota, i na Twoje żądanie (przycisk
-# "📥 Wczytaj backup"), bot odczytuje przypiętą wiadomość i odtwarza plik.
+# Żeby stan PRZETRWAŁ restart, bot robi automatyczny backup na Telegram (wysyła go
+# do Ciebie jako dokument i przypina wiadomość) za każdym razem gdy coś się zmieni.
+# Przy starcie bota, i na Twoje żądanie (przycisk "📥 Wczytaj backup"), bot odczytuje
+# przypiętą wiadomość i odtwarza plik.
 import json
 
-TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trades.json")
+STATE_PATH = os.environ.get("STATE_PATH", "bot_state.json")
+STATE_BACKUP_FILENAME = "bot_state.json"
 
-# Ustawiane raz w main() - potrzebne żeby _save_trades mógł automatycznie
+DEFAULT_POSITION_SIZES = {"ETH": 8000, "BTC": 10000, "XAUTUSDT": 10000}
+
+# Ustawiane raz w main() - potrzebne żeby _save_state mógł automatycznie
 # wywołać backup bez przekazywania api_url/chat_id przez cały łańcuch wywołań.
 _backup_ctx = {"api_url": None, "chat_id": None}
 
@@ -850,16 +1200,40 @@ def set_backup_context(api_url, chat_id):
     _backup_ctx["chat_id"] = chat_id
 
 
-def backup_trades_to_telegram():
-    """Wysyła trades.json jako dokument na Telegram i przypina wiadomość -
+def _load_state():
+    if not os.path.exists(STATE_PATH):
+        return {"trades": [], "position_sizes": {}}
+    try:
+        with open(STATE_PATH, "r") as f:
+            state = json.load(f)
+    except Exception as e:
+        log.error(f"Błąd odczytu {STATE_PATH}: {e}")
+        return {"trades": [], "position_sizes": {}}
+    state.setdefault("trades", [])
+    state.setdefault("position_sizes", {})
+    return state
+
+
+def _save_state(state):
+    try:
+        with open(STATE_PATH, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log.error(f"Błąd zapisu {STATE_PATH}: {e}")
+        return
+    backup_state_to_telegram()  # nadpisuje backup na bieżąco przy każdej zmianie
+
+
+def backup_state_to_telegram():
+    """Wysyła bot_state.json jako dokument na Telegram i przypina wiadomość -
     to nasza 'trwała pamięć' odporna na restart kontenera."""
     api_url, chat_id = _backup_ctx["api_url"], _backup_ctx["chat_id"]
-    if not api_url or not chat_id or not os.path.exists(TRADE_LOG_PATH):
+    if not api_url or not chat_id or not os.path.exists(STATE_PATH):
         return
     try:
-        with open(TRADE_LOG_PATH, "rb") as f:
-            files = {"document": ("trades.json", f, "application/json")}
-            data = {"chat_id": chat_id, "caption": "🗄️ auto-backup historii backtestu"}
+        with open(STATE_PATH, "rb") as f:
+            files = {"document": (STATE_BACKUP_FILENAME, f, "application/json")}
+            data = {"chat_id": chat_id, "caption": "🗄️ auto-backup stanu bota (backtest + rozmiary pozycji)"}
             r = _session.post(f"{api_url}/sendDocument", data=data, files=files, timeout=15)
         resp = r.json()
         if resp.get("ok"):
@@ -868,27 +1242,26 @@ def backup_trades_to_telegram():
                 "chat_id": chat_id, "message_id": message_id, "disable_notification": True,
             }, timeout=10)
         else:
-            log.warning(f"Backup trades nie powiódł się: {resp.get('description')}")
+            log.warning(f"Backup stanu nie powiódł się: {resp.get('description')}")
     except Exception as e:
-        log.error(f"Błąd backupu trades do Telegrama: {e}")
+        log.error(f"Błąd backupu stanu do Telegrama: {e}")
 
 
-def restore_trades_from_telegram(api_url, chat_id, force=False):
-    """Odczytuje przypiętą wiadomość z backupem i odtwarza trades.json.
-    force=False: nie nadpisuje, jeśli lokalny plik już istnieje (np. bot nie
-    restartował się między wywołaniami). force=True: zawsze nadpisuje (ręczne
-    wczytanie na żądanie przyciskiem)."""
-    if not force and os.path.exists(TRADE_LOG_PATH):
+def restore_state_from_telegram(api_url, chat_id, force=False):
+    """Odczytuje przypiętą wiadomość z backupem i odtwarza bot_state.json.
+    force=False: nie nadpisuje, jeśli lokalny plik już istnieje. force=True:
+    zawsze nadpisuje (ręczne wczytanie na żądanie przyciskiem)."""
+    if not force and os.path.exists(STATE_PATH):
         return "local"
     try:
         r = _session.get(f"{api_url}/getChat", params={"chat_id": chat_id}, timeout=10)
         data = r.json()
         pinned = data.get("result", {}).get("pinned_message")
         if not pinned or "document" not in pinned:
-            log.info("Brak zapisanego backupu trades na Telegramie - zaczynam od zera")
+            log.info("Brak zapisanego backupu stanu na Telegramie - zaczynam od zera")
             return "not_found"
         doc = pinned["document"]
-        if doc.get("file_name") != "trades.json":
+        if doc.get("file_name") != STATE_BACKUP_FILENAME:
             return "not_found"
 
         r2 = _session.get(f"{api_url}/getFile", params={"file_id": doc["file_id"]}, timeout=10)
@@ -897,34 +1270,36 @@ def restore_trades_from_telegram(api_url, chat_id, force=False):
         file_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
         r3 = _session.get(file_url, timeout=15)
         r3.raise_for_status()
-        with open(TRADE_LOG_PATH, "wb") as f:
+        with open(STATE_PATH, "wb") as f:
             f.write(r3.content)
-        log.info("Przywrócono historię backtestu z backupu na Telegramie")
+        log.info("Przywrócono stan bota z backupu na Telegramie")
         return "restored"
     except Exception as e:
-        log.warning(f"Nie udało się przywrócić backupu trades: {e}")
+        log.warning(f"Nie udało się przywrócić backupu stanu: {e}")
         return "error"
 
 
 def _load_trades():
-    if not os.path.exists(TRADE_LOG_PATH):
-        return []
-    try:
-        with open(TRADE_LOG_PATH, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        log.error(f"Błąd odczytu {TRADE_LOG_PATH}: {e}")
-        return []
+    return _load_state()["trades"]
 
 
 def _save_trades(trades):
-    try:
-        with open(TRADE_LOG_PATH, "w") as f:
-            json.dump(trades, f, indent=2)
-    except Exception as e:
-        log.error(f"Błąd zapisu {TRADE_LOG_PATH}: {e}")
-        return
-    backup_trades_to_telegram()  # nadpisuje backup na bieżąco przy każdej zmianie
+    state = _load_state()
+    state["trades"] = trades
+    _save_state(state)
+
+
+def get_position_size(symbol):
+    state = _load_state()
+    return state["position_sizes"].get(symbol, DEFAULT_POSITION_SIZES.get(symbol, POSITION_SIZE_USDT))
+
+
+def set_position_size(symbol, amount):
+    state = _load_state()
+    state["position_sizes"][symbol] = amount
+    _save_state(state)
+
+
 
 
 def record_signal(r):
@@ -1106,7 +1481,25 @@ def main_menu_keyboard():
     ], [
         {"text": "🥇 Złoto", "callback_data": "zloto"},
         {"text": "📥 Wczytaj backup", "callback_data": "restore_backup"},
+    ], [
+        {"text": "💰 Rozmiar pozycji", "callback_data": "size_menu"},
     ]]}
+
+
+def size_menu_keyboard():
+    """Jeden przycisk na każdy śledzony symbol (crypto + złoto), pokazujący
+    aktualny rozmiar - kliknięcie prosi o wpisanie nowej wartości."""
+    all_symbols = list(SYMBOLS) + [GOLD_SYMBOL]
+    buttons = []
+    for sym in all_symbols:
+        size = get_position_size(sym)
+        buttons.append([{"text": f"{sym}: ${size:,.0f}", "callback_data": f"setsize_{sym}"}])
+    return {"inline_keyboard": buttons}
+
+
+# Stan "czekam na liczbę od użytkownika" - per chat_id, żeby wiedzieć dla którego
+# symbolu ma być zastosowana kolejna wpisana wartość.
+_awaiting_size_input = {}
 
 
 def get_updates(api_url, offset=None):
@@ -1151,7 +1544,7 @@ def run_zloto(api_url, chat_id):
 
 
 def run_restore_backup(api_url, chat_id):
-    result = restore_trades_from_telegram(api_url, chat_id, force=True)
+    result = restore_state_from_telegram(api_url, chat_id, force=True)
     if result == "restored":
         send_message(api_url, chat_id, "✅ Backup wczytany. Oto aktualna historia:")
     elif result == "not_found":
@@ -1161,13 +1554,48 @@ def run_restore_backup(api_url, chat_id):
     send_message(api_url, chat_id, format_backtest_report())
 
 
+def run_size_menu(api_url, chat_id):
+    send_message(api_url, chat_id, "Wybierz symbol, żeby zmienić rozmiar pozycji:",
+                 reply_markup=size_menu_keyboard())
+
+
+def run_prompt_size_input(api_url, chat_id, symbol):
+    _awaiting_size_input[chat_id] = symbol
+    current = get_position_size(symbol)
+    send_message(api_url, chat_id,
+                 f"Aktualny rozmiar dla *{symbol}*: ${current:,.0f}\n"
+                 f"Wpisz nową wielkość pozycji w USDT (np. `8000`):")
+
+
+def try_handle_size_input(api_url, chat_id, text):
+    """Jeśli bot czeka na liczbę dla tego chatu, próbuje ją sparsować i zapisać.
+    Zwraca True jeśli to był taki przypadek (obsłużony), False w przeciwnym razie -
+    żeby wywołujący wiedział, czy iść dalej do zwykłej obsługi wiadomości."""
+    symbol = _awaiting_size_input.get(chat_id)
+    if not symbol:
+        return False
+    try:
+        amount = float(text.strip().replace(",", "").replace("$", ""))
+        if amount <= 0:
+            raise ValueError("Wartość musi być dodatnia")
+    except ValueError:
+        send_message(api_url, chat_id,
+                     f"⚠️ Nie rozpoznałem liczby w '{text}'. Wpisz sam rozmiar w USDT, np. `8000`.")
+        return True  # nadal czekamy - nie czyścimy stanu, użytkownik może spróbować ponownie
+    set_position_size(symbol, amount)
+    del _awaiting_size_input[chat_id]
+    send_message(api_url, chat_id, f"✅ Ustawiono rozmiar dla *{symbol}*: ${amount:,.0f}")
+    return True
+
+
 def main():
     token, default_chat_id, api_url = get_config()
     log.info(f"Bot startuje... symbole: {SYMBOLS}, timeframes: {TIMEFRAMES}")
     last_auto_alert_bias = {s: None for s in SYMBOLS}
+    last_auto_alert_time = {s: 0 for s in SYMBOLS}
 
     set_backup_context(api_url, default_chat_id)
-    restore_result = restore_trades_from_telegram(api_url, default_chat_id)
+    restore_result = restore_state_from_telegram(api_url, default_chat_id)
     if restore_result == "restored":
         log.info("Historia backtestu przywrócona z backupu na Telegramie")
 
@@ -1201,14 +1629,19 @@ def main():
                 if cq:
                     answer_callback_query(api_url, cq["id"])
                     cq_chat_id = cq["message"]["chat"]["id"]
-                    if cq["data"] == "analiza":
+                    cq_data = cq["data"]
+                    if cq_data == "analiza":
                         run_analiza(api_url, cq_chat_id)
-                    elif cq["data"] == "backtest":
+                    elif cq_data == "backtest":
                         run_backtest(api_url, cq_chat_id)
-                    elif cq["data"] == "zloto":
+                    elif cq_data == "zloto":
                         run_zloto(api_url, cq_chat_id)
-                    elif cq["data"] == "restore_backup":
+                    elif cq_data == "restore_backup":
                         run_restore_backup(api_url, cq_chat_id)
+                    elif cq_data == "size_menu":
+                        run_size_menu(api_url, cq_chat_id)
+                    elif cq_data.startswith("setsize_"):
+                        run_prompt_size_input(api_url, cq_chat_id, cq_data[len("setsize_"):])
                     continue
 
                 # --- Zwykła wiadomość tekstowa ---
@@ -1217,12 +1650,16 @@ def main():
                 chat_id = msg.get("chat", {}).get("id")
                 cmd = text.strip().lower() if text else ""
 
-                if cmd in ("/analiza", "/analysis"):
+                if chat_id and text and try_handle_size_input(api_url, chat_id, text):
+                    pass  # to była odpowiedź na "wpisz rozmiar" - już obsłużona
+                elif cmd in ("/analiza", "/analysis"):
                     run_analiza(api_url, chat_id)
                 elif cmd == "/backtest":
                     run_backtest(api_url, chat_id)
                 elif cmd in ("/zloto", "/gold"):
                     run_zloto(api_url, chat_id)
+                elif cmd == "/size":
+                    run_size_menu(api_url, chat_id)
                 elif chat_id:
                     # Cokolwiek innego (w tym /start) -> pokaż menu z przyciskami
                     send_message(api_url, chat_id, "Siema! Co potrzebujesz? 👇",
@@ -1234,10 +1671,28 @@ def main():
             if now - last_market_check >= CHECK_EVERY_SECONDS:
                 update_open_trades()
 
+                # Analiza wszystkich symboli RÓWNOLEGLE (każda to kilka requestów w środku,
+                # które też są już zrównoleglone - patrz analyze_symbol). Wysyłka wiadomości
+                # i zapis do backtestu zostają sekwencyjne, żeby uniknąć wyścigów przy
+                # zapisie pliku trades.json.
+                symbol_results = {}
+                with ThreadPoolExecutor(max_workers=len(SYMBOLS)) as executor:
+                    future_map = {executor.submit(analyze_symbol, s): s for s in SYMBOLS}
+                    for future in as_completed(future_map):
+                        sym = future_map[future]
+                        try:
+                            symbol_results[sym] = future.result()
+                        except Exception as e:
+                            log.error(f"Błąd analizy {sym}: {e}")
+
                 for symbol in SYMBOLS:
-                    r = analyze_symbol(symbol)
+                    r = symbol_results.get(symbol)
+                    if r is None:
+                        continue
                     if r["overall_bias"] in ("long", "short"):
-                        if r["overall_bias"] != last_auto_alert_bias[symbol]:
+                        bias_changed = r["overall_bias"] != last_auto_alert_bias[symbol]
+                        cooldown_ok = (now - last_auto_alert_time[symbol]) >= ALERT_COOLDOWN_SECONDS
+                        if bias_changed and cooldown_ok:
                             caption = "🔥 " + format_report(r)
                             try:
                                 chart = generate_chart(r)
@@ -1246,6 +1701,12 @@ def main():
                                 log.error(f"Błąd generowania wykresu {symbol}: {chart_err}")
                                 send_message(api_url, default_chat_id, caption)
                             record_signal(r)  # zapisz do backtestu przy KAŻDYM nowym sygnale
+                            last_auto_alert_bias[symbol] = r["overall_bias"]
+                            last_auto_alert_time[symbol] = now
+                        elif bias_changed:
+                            # Bias się zmienił, ale cooldown jeszcze trwa - zapamiętaj nowy
+                            # bias (żeby nie wysłać spóźnionego alertu po cooldownie na
+                            # already-stale sygnał), ale NIE resetuj timera cooldownu.
                             last_auto_alert_bias[symbol] = r["overall_bias"]
                     else:
                         last_auto_alert_bias[symbol] = None
