@@ -40,10 +40,18 @@ _session.mount("http://", HTTPAdapter(max_retries=_retry))
 # ---------- KONFIGURACJA ----------
 # Nazwy jak w Hyperliquid universe: "ETH", "BTC" (bez USDT na końcu - inaczej niż Binance)
 SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "ETH,BTC").split(",")]
-TIMEFRAMES = [s.strip() for s in os.environ.get("TIMEFRAMES", "15m,1h,4h").split(",")]
+TIMEFRAMES = [s.strip() for s in os.environ.get("TIMEFRAMES", "15m,1h,4h,1d").split(",")]
 CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "900"))
-# Auto-alert wysyłany gdy liczba zgodnych timeframe'ów >= próg (np. 2 z 3)
+# Auto-alert wysyłany gdy liczba zgodnych timeframe'ów >= próg. TRYB SNAJPERA:
+# domyślnie wymaga WSZYSTKICH 3 timeframe'ów naraz (nie 2 z 3) - mniej sygnałów,
+# ale każdy potwierdzony na każdym horyzoncie czasowym.
 CONFLUENCE_THRESHOLD = int(os.environ.get("CONFLUENCE_THRESHOLD", "2"))
+# Minimalna przewaga głosów (bullish - bearish) żeby w ogóle uznać kierunek za
+# sygnał, zamiast neutralny. Wyżej = rzadsze, ale mocniejsze sygnały.
+MIN_VOTE_MARGIN = int(os.environ.get("MIN_VOTE_MARGIN", "2"))
+# Czy wymagać co najmniej jednego "mocnego" sygnału SMC (sweep/FVG/IFVG/order
+# block) - jeśli True, sam trend+RSI+pattern nigdy nie wystarczy do sygnału.
+REQUIRE_PREMIUM_SIGNAL = os.environ.get("REQUIRE_PREMIUM_SIGNAL", "true").lower() == "true"
 # Minimalny odstęp między alertami dla TEGO SAMEGO symbolu - chroni przed spamem
 # gdy bias migocze (long/neutralny/long) w krótkim czasie. Domyślnie 1h.
 ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "3600"))
@@ -662,9 +670,18 @@ def analyze_timeframe(candles):
         else:
             bearish_votes.append(f"Order Block niedźwiedzi {ob['bottom']:.2f}-{ob['top']:.2f}")
 
-    if len(bullish_votes) > len(bearish_votes):
+    # --- TRYB SNAJPERA: mniej sygnałów, ale każdy musi mieć realne pokrycie ---
+    # Zwykła przewaga "2 głosy vs 1" to prawie coin-flip - stąd niski win rate.
+    # Wymagamy: (1) wyraźnej przewagi głosów (nie remisu o włos), ORAZ
+    # (2) obecności co najmniej jednego "mocnego" sygnału SMC (sweep, FVG, IFVG,
+    # order block) - a nie tylko zgodności leniwych wskaźników (EMA/RSI/pattern).
+    # Sam trend + RSI to za mało, żeby bot się odezwał.
+    has_premium_signal = bool(sweep or fvgs or ifvgs or order_blocks)
+    vote_margin = len(bullish_votes) - len(bearish_votes)
+
+    if vote_margin >= MIN_VOTE_MARGIN and (not REQUIRE_PREMIUM_SIGNAL or has_premium_signal):
         bias = "long"
-    elif len(bearish_votes) > len(bullish_votes):
+    elif -vote_margin >= MIN_VOTE_MARGIN and (not REQUIRE_PREMIUM_SIGNAL or has_premium_signal):
         bias = "short"
     else:
         bias = "neutralny"
@@ -751,7 +768,6 @@ def analyze_symbol(symbol, dex="", kline_fn=get_klines, stats_fn=get_24h_stats,
 
     # RR 1:2 na TP1 (odległość do TP1 = 2x odległość do SL), TP2 = 1:3 jako
     # dalszy, "rozciągnięty" cel dla tych co chcą trzymać dłużej.
-    RISK_ATR_MULT = 1.5
     entry_zone = stop_loss = tp1 = tp2 = None
     if overall_bias == "long":
         p, a_ = base_tf["price"], base_tf["atr"]
@@ -1189,6 +1205,9 @@ STATE_PATH = os.environ.get("STATE_PATH", "bot_state.json")
 STATE_BACKUP_FILENAME = "bot_state.json"
 
 DEFAULT_POSITION_SIZES = {"ETH": 8000, "BTC": 10000, "XAUTUSDT": 10000}
+# Wspólna stała ryzyka - używana zarówno przez bota na żywo jak i skrypt
+# backtestu historycznego, żeby obie ścieżki liczyły SL/TP identycznie.
+RISK_ATR_MULT = 1.5
 
 # Ustawiane raz w main() - potrzebne żeby _save_state mógł automatycznie
 # wywołać backup bez przekazywania api_url/chat_id przez cały łańcuch wywołań.
