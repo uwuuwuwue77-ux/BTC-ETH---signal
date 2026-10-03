@@ -40,18 +40,23 @@ _session.mount("http://", HTTPAdapter(max_retries=_retry))
 # ---------- KONFIGURACJA ----------
 # Nazwy jak w Hyperliquid universe: "ETH", "BTC" (bez USDT na końcu - inaczej niż Binance)
 SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "ETH,BTC").split(",")]
-TIMEFRAMES = [s.strip() for s in os.environ.get("TIMEFRAMES", "15m,1h,4h,1d").split(",")]
+TIMEFRAMES = [s.strip() for s in os.environ.get("TIMEFRAMES", "15m,1h,4h").split(",")]
 CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "900"))
 # Auto-alert wysyłany gdy liczba zgodnych timeframe'ów >= próg. TRYB SNAJPERA:
 # domyślnie wymaga WSZYSTKICH 3 timeframe'ów naraz (nie 2 z 3) - mniej sygnałów,
 # ale każdy potwierdzony na każdym horyzoncie czasowym.
-CONFLUENCE_THRESHOLD = int(os.environ.get("CONFLUENCE_THRESHOLD", "2"))
+CONFLUENCE_THRESHOLD = int(os.environ.get("CONFLUENCE_THRESHOLD", "3"))
 # Minimalna przewaga głosów (bullish - bearish) żeby w ogóle uznać kierunek za
 # sygnał, zamiast neutralny. Wyżej = rzadsze, ale mocniejsze sygnały.
-MIN_VOTE_MARGIN = int(os.environ.get("MIN_VOTE_MARGIN", "2"))
-# Czy wymagać co najmniej jednego "mocnego" sygnału SMC (sweep/FVG/IFVG/order
-# block) - jeśli True, sam trend+RSI+pattern nigdy nie wystarczy do sygnału.
+MIN_VOTE_MARGIN = int(os.environ.get("MIN_VOTE_MARGIN", "3"))
+# Czy wymagać sygnałów SMC (sweep/FVG/IFVG/order block) w ogóle - jeśli True,
+# sam trend+RSI+pattern nigdy nie wystarczy do sygnału.
 REQUIRE_PREMIUM_SIGNAL = os.environ.get("REQUIRE_PREMIUM_SIGNAL", "true").lower() == "true"
+# Ile RÓŻNYCH kategorii sygnału SMC (sweep, FVG, IFVG, order block) musi wskazywać
+# TEN SAM kierunek co finalny bias. Podniesione z 1 na 2 - jeden odosobniony sygnał
+# (np. sam FVG bez niczego więcej) już nie wystarczy, chcemy nałożenia się dwóch
+# niezależnych przesłanek smart money, nie jednej przypadkowej.
+MIN_PREMIUM_SIGNALS = int(os.environ.get("MIN_PREMIUM_SIGNALS", "1"))
 # Minimalny odstęp między alertami dla TEGO SAMEGO symbolu - chroni przed spamem
 # gdy bias migocze (long/neutralny/long) w krótkim czasie. Domyślnie 1h.
 ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "3600"))
@@ -671,17 +676,28 @@ def analyze_timeframe(candles):
             bearish_votes.append(f"Order Block niedźwiedzi {ob['bottom']:.2f}-{ob['top']:.2f}")
 
     # --- TRYB SNAJPERA: mniej sygnałów, ale każdy musi mieć realne pokrycie ---
-    # Zwykła przewaga "2 głosy vs 1" to prawie coin-flip - stąd niski win rate.
-    # Wymagamy: (1) wyraźnej przewagi głosów (nie remisu o włos), ORAZ
-    # (2) obecności co najmniej jednego "mocnego" sygnału SMC (sweep, FVG, IFVG,
-    # order block) - a nie tylko zgodności leniwych wskaźników (EMA/RSI/pattern).
-    # Sam trend + RSI to za mało, żeby bot się odezwał.
-    has_premium_signal = bool(sweep or fvgs or ifvgs or order_blocks)
+    # Liczymy ile RÓŻNYCH kategorii SMC (sweep, FVG, IFVG, order block) wskazuje
+    # na byczy kierunek, a ile na niedźwiedzi - osobno, bo jeden odosobniony
+    # sygnał (np. tylko FVG) to za mało, chcemy nałożenia się kilku przesłanek.
+    bullish_premium_categories = sum([
+        bool(sweep and sweep["type"] == "sweep_low"),
+        bool(fvgs and any(g["type"] == "bullish" for g in fvgs)),
+        bool(ifvgs and any(g["type"] == "bullish" for g in ifvgs)),
+        bool(order_blocks and any(o["type"] == "bullish" for o in order_blocks)),
+    ])
+    bearish_premium_categories = sum([
+        bool(sweep and sweep["type"] == "sweep_high"),
+        bool(fvgs and any(g["type"] == "bearish" for g in fvgs)),
+        bool(ifvgs and any(g["type"] == "bearish" for g in ifvgs)),
+        bool(order_blocks and any(o["type"] == "bearish" for o in order_blocks)),
+    ])
     vote_margin = len(bullish_votes) - len(bearish_votes)
 
-    if vote_margin >= MIN_VOTE_MARGIN and (not REQUIRE_PREMIUM_SIGNAL or has_premium_signal):
+    if (vote_margin >= MIN_VOTE_MARGIN
+            and (not REQUIRE_PREMIUM_SIGNAL or bullish_premium_categories >= MIN_PREMIUM_SIGNALS)):
         bias = "long"
-    elif -vote_margin >= MIN_VOTE_MARGIN and (not REQUIRE_PREMIUM_SIGNAL or has_premium_signal):
+    elif (-vote_margin >= MIN_VOTE_MARGIN
+            and (not REQUIRE_PREMIUM_SIGNAL or bearish_premium_categories >= MIN_PREMIUM_SIGNALS)):
         bias = "short"
     else:
         bias = "neutralny"
